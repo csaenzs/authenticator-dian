@@ -18,7 +18,7 @@ StandardError=journal
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=/opt/tokendian/secrets /opt/tokendian/.browser-profile /tmp
+ReadWritePaths=/opt/tokendian/sessions /opt/tokendian/.browser-profiles /tmp
 ProtectHome=true
 
 [Install]

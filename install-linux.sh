@@ -17,9 +17,9 @@ if ! id "$SERVICE_USER" >/dev/null 2>&1; then
 fi
 
 echo "==> Preparando directorios"
-mkdir -p "$INSTALL_DIR/secrets" "$INSTALL_DIR/.browser-profile"
+mkdir -p "$INSTALL_DIR/sessions" "$INSTALL_DIR/.browser-profiles"
 chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
-chmod 700 "$INSTALL_DIR/secrets"
+chmod 700 "$INSTALL_DIR/sessions"
 
 echo "==> Creando entorno virtual"
 sudo -u "$SERVICE_USER" "$PYTHON_BIN" -m venv "$INSTALL_DIR/.venv"
@@ -36,14 +36,17 @@ systemctl daemon-reload
 
 echo
 echo "==> Listo. Ahora:"
-echo "   1. Copia tu cert .p12 a $INSTALL_DIR/secrets/cert-modern.p12"
-echo "      (si es legacy, conviértelo primero — ver convert-cert-linux.sh)"
-echo "   2. Copia .env.example a .env y rellena los valores reales:"
+echo "   1. Copia .env.example a .env y rellena SERVICE_API_KEY:"
 echo "        cp $INSTALL_DIR/.env.example $INSTALL_DIR/.env"
+echo "        # genera un API key largo:"
+echo "        echo \"SERVICE_API_KEY=\$(openssl rand -hex 32)\" >> $INSTALL_DIR/.env"
 echo "        chmod 600 $INSTALL_DIR/.env"
 echo "        chown $SERVICE_USER:$SERVICE_USER $INSTALL_DIR/.env"
-echo "   3. Arranca el servicio:"
+echo "   2. Arranca el servicio:"
 echo "        systemctl enable --now tokendian"
 echo "        systemctl status tokendian"
-echo "   4. Verifica que responde:"
+echo "   3. Verifica que responde:"
 echo "        curl http://127.0.0.1:8765/health"
+echo
+echo "Las credenciales DIAN (cert, password, NIT, cédula, CapSolver key)"
+echo "las envía el cliente en cada /auth/login. NO se guardan en el server."

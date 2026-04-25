@@ -1,11 +1,16 @@
-"""Servicio HTTP que mantiene una sesión DIAN viva.
+"""Servicio HTTP multi-tenant para autenticación DIAN.
+
+Cada cliente envía sus propias credenciales (.p12 base64, password, NIT, cédula,
+CapSolver key). El servicio mantiene cookies por tenant, validándolas
+inteligentemente para minimizar llamadas a CapSolver.
 
 Endpoints:
-  GET  /health              - ping
-  GET  /auth/status         - estado de la sesión sin tocar DIAN
-  GET  /auth/cookies        - devuelve cookies vigentes (login automático si caducó)
-  POST /auth/refresh        - fuerza login fresco
-  GET  /auth/cookies/netscape - cookies en formato Netscape (listas para cURL)
+  GET  /health                          - ping (sin auth)
+  POST /auth/login                      - hace login fresco
+  POST /auth/get_or_login               - reusa cache si vive, sino login
+  GET  /auth/cookies?tenant_id=X        - lee cache, 410 si murió
+  GET  /auth/cookies/netscape?tenant_id=X - igual + formato cURL
+  GET  /auth/status?tenant_id=X         - estado sin tocar DIAN
 
 Autenticación: header X-API-Key con valor SERVICE_API_KEY.
 """
@@ -20,7 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 try:
     from dotenv import load_dotenv
@@ -28,8 +33,8 @@ try:
 except ImportError:
     pass
 
-from auth_service import AuthService
-from dian_login import CapSolverError, DianLoginRejected, TurnstileChallengeError
+from auth_service import TenantManager, make_tenant_id
+from dian_login import URLS, CapSolverError, DianLoginRejected, TurnstileChallengeError
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -39,52 +44,49 @@ logging.basicConfig(
 log = logging.getLogger("tokendian.server")
 
 
-# ---------- bootstrap del servicio ----------
+# ---------- bootstrap ----------
 
-def _build_service() -> AuthService:
-    required = ["DIAN_CERT_PATH", "DIAN_CERT_PASSWORD", "DIAN_USER_CODE",
-                "DIAN_COMPANY_CODE", "CAPSOLVER_API_KEY"]
-    missing = [k for k in required if not os.environ.get(k)]
-    if missing:
-        raise RuntimeError(f"Faltan variables de entorno: {', '.join(missing)}")
+def _build_manager() -> TenantManager:
+    if not os.environ.get("SERVICE_API_KEY"):
+        raise RuntimeError("SERVICE_API_KEY no configurada")
 
-    return AuthService(
-        env=os.getenv("DIAN_ENV", "hab"),
-        cert_path=os.environ["DIAN_CERT_PATH"],
-        cert_pwd=os.environ["DIAN_CERT_PASSWORD"],
-        user_code=os.environ["DIAN_USER_CODE"],
-        comp_code=os.environ["DIAN_COMPANY_CODE"],
-        id_type=os.getenv("DIAN_ID_TYPE", "10910094"),
-        capsolver_key=os.environ["CAPSOLVER_API_KEY"],
+    base = Path(__file__).resolve().parent
+    sessions_dir = Path(os.getenv("SESSIONS_DIR", str(base / "sessions")))
+    profiles_root = Path(os.getenv("BROWSER_PROFILES_ROOT", str(base / ".browser-profiles")))
+
+    return TenantManager(
+        sessions_dir=sessions_dir,
+        browser_profiles_root=profiles_root,
         headless=os.getenv("HEADLESS", "true").lower() == "true",
         validation_ttl_seconds=int(os.getenv("VALIDATION_TTL_SECONDS", "300")),
     )
 
 
-_service: Optional[AuthService] = None
+_manager: Optional[TenantManager] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _service
-    _service = _build_service()
-    log.info("AuthService iniciado (env=%s, ttl=%ds)", _service.env, _service.validation_ttl_seconds)
+    global _manager
+    _manager = _build_manager()
+    log.info("TenantManager iniciado (ttl=%ds, headless=%s)",
+             _manager.validation_ttl_seconds, _manager.headless)
     yield
     log.info("Apagando servicio")
 
 
 app = FastAPI(
     title="DIAN Auth Service",
-    description="Mantiene una sesión DIAN viva minimizando llamadas a CapSolver",
-    version="1.0.0",
+    description="Servicio multi-tenant que mantiene sesiones DIAN minimizando CapSolver",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
 
-def get_service() -> AuthService:
-    if _service is None:
+def get_manager() -> TenantManager:
+    if _manager is None:
         raise HTTPException(503, "Servicio aún no inicializado")
-    return _service
+    return _manager
 
 
 # ---------- auth ----------
@@ -100,81 +102,55 @@ def require_api_key(x_api_key: Optional[str] = Header(None, alias=API_KEY_HEADER
         raise HTTPException(401, "API key inválida o faltante")
 
 
-# ---------- response models ----------
+# ---------- request/response models ----------
 
-class HealthResponse(BaseModel):
-    status: str = "ok"
-    service: str = "tokendian"
+class LoginRequest(BaseModel):
+    certificado_base64: str = Field(..., description="Archivo .p12 codificado en base64")
+    certificado_password: str = Field(..., description="Contraseña del .p12")
+    user_code: str = Field(..., description="Cédula del representante legal", examples=["1117488256"])
+    company_code: str = Field(..., description="NIT empresa sin DV", examples=["9015591465"])
+    id_type: str = Field("10910094", description="Tipo de identificación. 10910094 = Cédula CC")
+    env: str = Field("hab", description="hab | prod")
+    capsolver_api_key: str = Field(..., description="API key de capsolver.com")
+
+
+class LoginResponse(BaseModel):
+    tenant_id: str
+    env: str
+    cookies: list[dict]
+    reason: str
+    cookie_count: int
 
 
 class StatusResponse(BaseModel):
+    tenant_id: str
     env: str
+    user_code: str
+    company_code: str
     has_cookies: bool
     cookie_count: int
     last_validated_at: Optional[float]
     last_validated_seconds_ago: Optional[int]
     last_login_at: Optional[float]
-    login_count_since_start: int
+    login_count: int
     validation_ttl_seconds: int
-    cookies_path: str
 
 
-class CookiesResponse(BaseModel):
-    env: str
-    reason: str
-    validated_at: Optional[float]
-    cookies: list[dict]
+# ---------- helpers ----------
+
+def _validate_env(env: str) -> None:
+    if env not in URLS:
+        raise HTTPException(400, f"env inválido: {env!r}. Usa 'hab' o 'prod'.")
 
 
-# ---------- endpoints ----------
+def _map_dian_errors(e: Exception) -> HTTPException:
+    msg = f"{type(e).__name__}: {e}"
+    if isinstance(e, ValueError):
+        return HTTPException(400, msg)
+    if isinstance(e, (DianLoginRejected, CapSolverError, TurnstileChallengeError)):
+        return HTTPException(502, msg)
+    return HTTPException(500, msg)
 
-@app.get("/health", response_model=HealthResponse)
-def health():
-    return HealthResponse()
-
-
-@app.get("/auth/status", response_model=StatusResponse, dependencies=[Depends(require_api_key)])
-def auth_status(svc: AuthService = Depends(get_service)):
-    return svc.status()
-
-
-@app.get("/auth/cookies", response_model=CookiesResponse, dependencies=[Depends(require_api_key)])
-async def auth_cookies(
-    validate: bool = True,
-    svc: AuthService = Depends(get_service),
-):
-    """Devuelve cookies vigentes (formato Playwright JSON).
-
-    - validate=true (default): valida sesión si pasó el TTL
-    - validate=false: devuelve cache sin tocar DIAN (úsalo en peticiones rápidas
-      cuando ya sabes que validaste hace poco)
-    """
-    try:
-        return await svc.get_cookies(validate=validate)
-    except (DianLoginRejected, CapSolverError, TurnstileChallengeError) as e:
-        raise HTTPException(502, f"{type(e).__name__}: {e}")
-
-
-@app.post("/auth/refresh", response_model=CookiesResponse, dependencies=[Depends(require_api_key)])
-async def auth_refresh(svc: AuthService = Depends(get_service)):
-    try:
-        return await svc.force_refresh()
-    except (DianLoginRejected, CapSolverError, TurnstileChallengeError) as e:
-        raise HTTPException(502, f"{type(e).__name__}: {e}")
-
-
-@app.get("/auth/cookies/netscape", dependencies=[Depends(require_api_key)])
-async def auth_cookies_netscape(
-    validate: bool = True,
-    svc: AuthService = Depends(get_service),
-):
-    """Cookies en formato Netscape (listo para CURLOPT_COOKIEFILE de cURL/PHP)."""
-    data = await svc.get_cookies(validate=validate)
-    netscape = _to_netscape(data["cookies"])
-    return Response(content=netscape, media_type="text/plain")
-
-
-# ---------- conversor a formato Netscape ----------
 
 def _to_netscape(cookies: list[dict]) -> str:
     lines = [
@@ -197,3 +173,106 @@ def _to_netscape(cookies: list[dict]) -> str:
         prefix = "#HttpOnly_" if c.get("httpOnly") else ""
         lines.append(f"{prefix}{domain}\t{domain_specified}\t{path}\t{secure}\t{expires}\t{name}\t{value}")
     return "\n".join(lines) + "\n"
+
+
+# ---------- endpoints ----------
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "tokendian"}
+
+
+@app.post("/auth/login", response_model=LoginResponse, dependencies=[Depends(require_api_key)])
+async def auth_login(req: LoginRequest, mgr: TenantManager = Depends(get_manager)):
+    """Hace login fresco con browser + CapSolver. Sobrescribe cookies del tenant."""
+    _validate_env(req.env)
+    try:
+        t = await mgr.login(
+            cert_base64=req.certificado_base64,
+            cert_password=req.certificado_password,
+            user_code=req.user_code,
+            company_code=req.company_code,
+            id_type=req.id_type,
+            env=req.env,
+            capsolver_api_key=req.capsolver_api_key,
+        )
+    except Exception as e:
+        log.exception("Login falló")
+        raise _map_dian_errors(e)
+
+    return LoginResponse(
+        tenant_id=t.tenant_id,
+        env=t.env,
+        cookies=t.cookies,
+        reason="full_login",
+        cookie_count=len(t.cookies),
+    )
+
+
+@app.post("/auth/get_or_login", response_model=LoginResponse, dependencies=[Depends(require_api_key)])
+async def auth_get_or_login(req: LoginRequest, mgr: TenantManager = Depends(get_manager)):
+    """Reusa cache si la sesión vive; sino hace login. Una sola llamada que siempre funciona."""
+    _validate_env(req.env)
+    try:
+        t, reason = await mgr.get_or_login(
+            cert_base64=req.certificado_base64,
+            cert_password=req.certificado_password,
+            user_code=req.user_code,
+            company_code=req.company_code,
+            id_type=req.id_type,
+            env=req.env,
+            capsolver_api_key=req.capsolver_api_key,
+        )
+    except Exception as e:
+        log.exception("get_or_login falló")
+        raise _map_dian_errors(e)
+
+    return LoginResponse(
+        tenant_id=t.tenant_id,
+        env=t.env,
+        cookies=t.cookies,
+        reason=reason,
+        cookie_count=len(t.cookies),
+    )
+
+
+@app.get("/auth/cookies", dependencies=[Depends(require_api_key)])
+async def auth_cookies(tenant_id: str, mgr: TenantManager = Depends(get_manager)):
+    """Devuelve cookies cacheadas (formato Playwright JSON).
+
+    410 Gone si la sesión murió o el tenant no existe — el cliente debe re-llamar /auth/login.
+    """
+    t, reason = await mgr.get_cookies_only(tenant_id)
+    if t is None:
+        raise HTTPException(410, f"Sesión no disponible: {reason}. Vuelve a llamar /auth/login.")
+    return {
+        "tenant_id": t.tenant_id,
+        "env": t.env,
+        "cookies": t.cookies,
+        "cookie_count": len(t.cookies),
+        "reason": reason,
+    }
+
+
+@app.get("/auth/cookies/netscape", dependencies=[Depends(require_api_key)])
+async def auth_cookies_netscape(tenant_id: str, mgr: TenantManager = Depends(get_manager)):
+    """Cookies en formato Netscape (listo para CURLOPT_COOKIEFILE de PHP/cURL)."""
+    t, reason = await mgr.get_cookies_only(tenant_id)
+    if t is None:
+        raise HTTPException(410, f"Sesión no disponible: {reason}. Vuelve a llamar /auth/login.")
+    return Response(content=_to_netscape(t.cookies), media_type="text/plain")
+
+
+@app.get("/auth/status", response_model=StatusResponse, dependencies=[Depends(require_api_key)])
+async def auth_status(tenant_id: str, mgr: TenantManager = Depends(get_manager)):
+    s = await mgr.get_status(tenant_id)
+    if s is None:
+        raise HTTPException(404, f"Tenant {tenant_id} no encontrado")
+    return s
+
+
+@app.get("/auth/tenant_id", dependencies=[Depends(require_api_key)])
+def auth_tenant_id(env: str, user_code: str, company_code: str):
+    """Helper: calcula el tenant_id determinista a partir de las credenciales."""
+    _validate_env(env)
+    return {"tenant_id": make_tenant_id(env, user_code, company_code)}

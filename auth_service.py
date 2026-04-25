@@ -1,176 +1,299 @@
-"""Servicio de autenticación con cache + validación inteligente.
+"""Multi-tenant: maneja N sesiones DIAN simultáneas, una por (env|NIT|cédula).
 
-Estrategia para minimizar llamadas a CapSolver:
+Diseño:
+- TenantManager: dict de Tenant por tenant_id (sha256 corto de las credenciales).
+- Tenant: cookies + metadata + lock por tenant.
+- Las credenciales sensibles (.p12, password, capsolver_key) NO se persisten —
+  solo viven durante el login. Si la sesión expira de verdad, el cliente debe
+  volver a llamar /auth/login.
 
-1. Cookies en memoria (proceso) + persistidas en disco.
-2. Validación HTTP barata (httpx, no Playwright) cada vez que se piden cookies,
-   pero solo si pasaron > VALIDATION_TTL desde la última validación exitosa.
-3. Si la validación HTTP da 'expired' → intentar validación con browser
-   (a veces httpx falla por Cloudflare aunque la sesión esté viva).
-4. Solo si TODO falla → login completo con CapSolver.
-5. Lock asíncrono: si N peticiones llegan a la vez y la sesión expiró,
-   solo UN login se ejecuta (las demás esperan ese resultado).
+Optimizaciones para minimizar CapSolver:
+1. Cache en memoria + persistencia de cookies en disco.
+2. Validación HTTP barata (httpx) si pasó el TTL.
+3. Validación con browser headless si httpx falló (Cloudflare puede mentir).
+4. Solo si TODO falla → 410 Gone (cliente reintenta login).
+5. Lock por tenant: peticiones concurrentes del mismo cliente solo gatillan 1 login.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import json
 import logging
 import os
+import tempfile
 import time
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 from patchright.async_api import async_playwright
 
 from dian_login import (
-    DEFAULT_COOKIES,
-    DEFAULT_PROFILE,
     URLS,
     _login_with_capsolver,
     _validate_saved_cookies_browser,
-    load_cookies,
-    save_cookies,
     validate_cookies_http,
 )
 
 log = logging.getLogger("tokendian.auth")
 
 
-class AuthService:
-    """Mantiene una sesión DIAN viva con mínimas llamadas a CapSolver."""
+def make_tenant_id(env: str, user_code: str, company_code: str) -> str:
+    """ID determinista — mismas credenciales = mismo tenant_id."""
+    raw = f"{env}|{user_code}|{company_code}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
 
-    def __init__(
-        self,
-        env: str,
-        cert_path: str,
-        cert_pwd: str,
-        user_code: str,
-        comp_code: str,
-        id_type: str,
-        capsolver_key: str,
-        headless: bool = True,
-        cookies_path: Optional[Path] = None,
-        user_data_dir: Optional[str] = None,
-        validation_ttl_seconds: int = 300,
-    ) -> None:
-        if env not in URLS:
-            raise ValueError(f"env inválido: {env!r}")
-        self.env = env
-        self.cert_path = cert_path
-        self.cert_pwd = cert_pwd
-        self.user_code = user_code
-        self.comp_code = comp_code
-        self.id_type = id_type
-        self.capsolver_key = capsolver_key
-        self.headless = headless
-        self.cookies_path = cookies_path or Path(os.getenv("COOKIES_PATH", str(DEFAULT_COOKIES)))
-        self.user_data_dir = user_data_dir or os.getenv("BROWSER_PROFILE_DIR", DEFAULT_PROFILE)
-        self.validation_ttl_seconds = validation_ttl_seconds
 
-        self._base_catalogo = URLS[env]["catalogo"]
-        self._base_cert     = URLS[env]["cert"]
+@contextmanager
+def _temp_cert_file(p12_bytes: bytes):
+    """Escribe el .p12 en disco temporalmente. Garantiza limpieza al salir."""
+    fd, path = tempfile.mkstemp(suffix=".p12", prefix="dian_cert_")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(p12_bytes)
+        os.chmod(path, 0o600)
+        yield path
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
-        self._cookies: Optional[list[dict]] = load_cookies(self.cookies_path)
-        self._last_validated_at: float = 0.0
-        self._last_login_at: float = 0.0
-        self._login_count: int = 0
-        self._lock = asyncio.Lock()
+
+@dataclass
+class Tenant:
+    tenant_id: str
+    env: str
+    user_code: str
+    company_code: str
+    id_type: str
+    cookies: list[dict] = field(default_factory=list)
+    last_validated_at: float = 0.0
+    last_login_at: float = 0.0
+    login_count: int = 0
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     @property
     def has_cookies(self) -> bool:
-        return self._cookies is not None and len(self._cookies) > 0
+        return bool(self.cookies)
 
     def status(self) -> dict:
         now = time.time()
         return {
+            "tenant_id": self.tenant_id,
             "env": self.env,
+            "user_code": self.user_code,
+            "company_code": self.company_code,
             "has_cookies": self.has_cookies,
-            "cookie_count": len(self._cookies) if self._cookies else 0,
-            "last_validated_at": self._last_validated_at or None,
-            "last_validated_seconds_ago": int(now - self._last_validated_at) if self._last_validated_at else None,
-            "last_login_at": self._last_login_at or None,
-            "login_count_since_start": self._login_count,
-            "validation_ttl_seconds": self.validation_ttl_seconds,
-            "cookies_path": str(self.cookies_path),
+            "cookie_count": len(self.cookies),
+            "last_validated_at": self.last_validated_at or None,
+            "last_validated_seconds_ago": int(now - self.last_validated_at) if self.last_validated_at else None,
+            "last_login_at": self.last_login_at or None,
+            "login_count": self.login_count,
         }
 
-    async def get_cookies(self, *, validate: bool = True) -> dict:
-        """Devuelve cookies vigentes. Login automático si caducaron.
 
-        - Si las cookies se validaron hace < TTL, se asume válidas (ahorra red).
-        - Si TTL expiró, valida con httpx (barato).
-        - Si httpx dice 'expired', intenta browser (a veces Cloudflare miente).
-        - Solo hace login si todo lo anterior falla.
-        """
-        async with self._lock:
-            now = time.time()
+class TenantManager:
+    """Administra múltiples Tenants, persiste cookies por tenant."""
 
-            if not self.has_cookies:
-                log.info("No hay cookies en cache, ejecutando login inicial")
-                await self._do_full_login()
-                return self._build_response(reason="initial_login")
+    def __init__(
+        self,
+        sessions_dir: Path,
+        browser_profiles_root: Path,
+        headless: bool = True,
+        validation_ttl_seconds: int = 300,
+    ):
+        self.sessions_dir = Path(sessions_dir)
+        self.browser_profiles_root = Path(browser_profiles_root)
+        self.headless = headless
+        self.validation_ttl_seconds = validation_ttl_seconds
+        self._tenants: dict[str, Tenant] = {}
+        self._global_lock = asyncio.Lock()
 
-            if not validate:
-                return self._build_response(reason="cache_no_validate")
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        self.browser_profiles_root.mkdir(parents=True, exist_ok=True)
 
-            seconds_since_validation = now - self._last_validated_at
-            if seconds_since_validation < self.validation_ttl_seconds:
-                return self._build_response(reason=f"cache_recent_{int(seconds_since_validation)}s")
+    # ---------- persistencia ----------
 
-            # TTL expirado: validar con httpx (rápido, sin browser)
-            check = validate_cookies_http(self._cookies, self.env)
-            if check["valid"]:
-                self._last_validated_at = now
-                return self._build_response(reason="validated_http")
+    def _cookies_file(self, tenant_id: str) -> Path:
+        return self.sessions_dir / f"{tenant_id}.json"
 
-            log.info("Validación HTTP indica %s. Probando con browser...", check.get("status"))
+    def _meta_file(self, tenant_id: str) -> Path:
+        return self.sessions_dir / f"{tenant_id}.meta.json"
 
-            # httpx falló: puede ser Cloudflare o sesión real expirada
-            async with async_playwright() as p:
-                refreshed = await _validate_saved_cookies_browser(
-                    p, self._base_cert, self.cert_path, self.cert_pwd,
-                    self._cookies, self.user_data_dir,
+    def _profile_dir(self, tenant_id: str) -> str:
+        return str(self.browser_profiles_root / tenant_id)
+
+    def _persist(self, t: Tenant) -> None:
+        self._cookies_file(t.tenant_id).write_text(
+            json.dumps(t.cookies, indent=2), encoding="utf-8"
+        )
+        meta = {
+            "tenant_id": t.tenant_id,
+            "env": t.env,
+            "user_code": t.user_code,
+            "company_code": t.company_code,
+            "id_type": t.id_type,
+            "last_validated_at": t.last_validated_at,
+            "last_login_at": t.last_login_at,
+            "login_count": t.login_count,
+        }
+        self._meta_file(t.tenant_id).write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        try:
+            os.chmod(self._cookies_file(t.tenant_id), 0o600)
+            os.chmod(self._meta_file(t.tenant_id), 0o600)
+        except OSError:
+            pass
+
+    def _load_from_disk(self, tenant_id: str) -> Optional[Tenant]:
+        meta_path = self._meta_file(tenant_id)
+        cookies_path = self._cookies_file(tenant_id)
+        if not meta_path.exists() or not cookies_path.exists():
+            return None
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            cookies = json.loads(cookies_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        return Tenant(
+            tenant_id=meta["tenant_id"],
+            env=meta["env"],
+            user_code=meta["user_code"],
+            company_code=meta["company_code"],
+            id_type=meta.get("id_type", "10910094"),
+            cookies=cookies,
+            last_validated_at=meta.get("last_validated_at", 0.0),
+            last_login_at=meta.get("last_login_at", 0.0),
+            login_count=meta.get("login_count", 0),
+        )
+
+    # ---------- lookup ----------
+
+    async def _get_tenant(self, tenant_id: str) -> Optional[Tenant]:
+        if tenant_id in self._tenants:
+            return self._tenants[tenant_id]
+        async with self._global_lock:
+            if tenant_id in self._tenants:
+                return self._tenants[tenant_id]
+            t = self._load_from_disk(tenant_id)
+            if t is not None:
+                self._tenants[tenant_id] = t
+            return t
+
+    # ---------- operaciones públicas ----------
+
+    async def login(
+        self,
+        *,
+        cert_base64: str,
+        cert_password: str,
+        user_code: str,
+        company_code: str,
+        id_type: str,
+        env: str,
+        capsolver_api_key: str,
+    ) -> Tenant:
+        """Hace login completo (browser + CapSolver). Reemplaza cookies del tenant si existía."""
+        if env not in URLS:
+            raise ValueError(f"env inválido: {env!r}. Usa 'hab' o 'prod'.")
+        try:
+            p12_bytes = base64.b64decode(cert_base64, validate=True)
+        except Exception as e:
+            raise ValueError(f"certificado_base64 inválido: {e}")
+        if len(p12_bytes) < 100:
+            raise ValueError("certificado_base64 demasiado corto")
+
+        tenant_id = make_tenant_id(env, user_code, company_code)
+
+        async with self._global_lock:
+            if tenant_id not in self._tenants:
+                cached = self._load_from_disk(tenant_id)
+                self._tenants[tenant_id] = cached or Tenant(
+                    tenant_id=tenant_id,
+                    env=env,
+                    user_code=user_code,
+                    company_code=company_code,
+                    id_type=id_type,
                 )
+        t = self._tenants[tenant_id]
 
-            if refreshed:
-                self._cookies = refreshed
-                save_cookies(self._cookies, self.cookies_path)
-                self._last_validated_at = now
-                return self._build_response(reason="validated_browser")
+        async with t.lock:
+            base_catalogo = URLS[env]["catalogo"]
+            base_cert     = URLS[env]["cert"]
+            user_data_dir = self._profile_dir(tenant_id)
 
-            log.info("Sesión expirada según browser, ejecutando login completo")
-            await self._do_full_login()
-            return self._build_response(reason="full_login")
+            with _temp_cert_file(p12_bytes) as cert_path:
+                async with async_playwright() as p:
+                    cookies = await _login_with_capsolver(
+                        p, env, base_catalogo, base_cert,
+                        cert_path, cert_password,
+                        user_code, company_code, id_type,
+                        capsolver_api_key, self.headless, user_data_dir,
+                    )
 
-    async def force_refresh(self) -> dict:
-        """Fuerza un login fresco (ignora cache)."""
-        async with self._lock:
-            log.info("force_refresh solicitado")
-            await self._do_full_login()
-            return self._build_response(reason="force_refresh")
+            now = time.time()
+            t.cookies = cookies
+            t.id_type = id_type
+            t.last_login_at = now
+            t.last_validated_at = now
+            t.login_count += 1
+            self._persist(t)
+            log.info("Login completo exitoso (tenant=%s, count=%d)", tenant_id, t.login_count)
+            return t
 
-    async def _do_full_login(self) -> None:
-        async with async_playwright() as p:
-            cookies = await _login_with_capsolver(
-                p, self.env,
-                self._base_catalogo, self._base_cert,
-                self.cert_path, self.cert_pwd,
-                self.user_code, self.comp_code, self.id_type,
-                self.capsolver_key, self.headless, self.user_data_dir,
-            )
-        self._cookies = cookies
-        save_cookies(self._cookies, self.cookies_path)
-        now = time.time()
-        self._last_validated_at = now
-        self._last_login_at = now
-        self._login_count += 1
-        log.info("Login completo exitoso (count=%d)", self._login_count)
+    async def get_or_login(self, **login_kwargs) -> tuple[Tenant, str]:
+        """Si la sesión cacheada vive, la devuelve. Sino hace login.
 
-    def _build_response(self, *, reason: str) -> dict:
-        return {
-            "cookies": self._cookies,
-            "env": self.env,
-            "validated_at": self._last_validated_at,
-            "reason": reason,
-        }
+        Retorna (tenant, reason) donde reason explica qué se hizo.
+        """
+        env = login_kwargs["env"]
+        user_code = login_kwargs["user_code"]
+        company_code = login_kwargs["company_code"]
+        tenant_id = make_tenant_id(env, user_code, company_code)
+
+        existing = await self._get_tenant(tenant_id)
+        if existing and existing.has_cookies:
+            tenant, reason = await self._validate_or_none(existing)
+            if tenant is not None:
+                return tenant, reason
+
+        t = await self.login(**login_kwargs)
+        return t, "full_login"
+
+    async def _validate_or_none(self, t: Tenant) -> tuple[Optional[Tenant], str]:
+        """Devuelve (tenant, motivo) si la sesión está viva, (None, motivo) si no."""
+        async with t.lock:
+            now = time.time()
+            seconds_since = now - t.last_validated_at if t.last_validated_at else 999999
+            if seconds_since < self.validation_ttl_seconds:
+                return t, f"cache_recent_{int(seconds_since)}s"
+
+            check = validate_cookies_http(t.cookies, t.env)
+            if check["valid"]:
+                t.last_validated_at = now
+                self._persist(t)
+                return t, "validated_http"
+
+            log.info("Validación HTTP del tenant %s: %s", t.tenant_id, check.get("status"))
+            return None, f"http_check_failed_{check.get('status')}"
+
+    async def get_cookies_only(self, tenant_id: str) -> tuple[Optional[Tenant], str]:
+        """Solo lee cache (no hace login). Devuelve (None, motivo) si la sesión murió."""
+        t = await self._get_tenant(tenant_id)
+        if t is None:
+            return None, "tenant_not_found"
+        if not t.has_cookies:
+            return None, "no_cookies"
+        return await self._validate_or_none(t)
+
+    async def get_status(self, tenant_id: str) -> Optional[dict]:
+        t = await self._get_tenant(tenant_id)
+        if t is None:
+            return None
+        s = t.status()
+        s["validation_ttl_seconds"] = self.validation_ttl_seconds
+        return s
