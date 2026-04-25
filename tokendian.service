@@ -1,0 +1,25 @@
+[Unit]
+Description=DIAN Auth Service (tokendian)
+After=network.target
+
+[Service]
+Type=simple
+User=tokendian
+Group=tokendian
+WorkingDirectory=/opt/tokendian
+EnvironmentFile=/opt/tokendian/.env
+ExecStart=/opt/tokendian/.venv/bin/uvicorn server:app --host 127.0.0.1 --port 8765 --workers 1
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/tokendian/secrets /opt/tokendian/.browser-profile /tmp
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

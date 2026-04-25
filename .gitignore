@@ -1,0 +1,25 @@
+# Secretos y datos de sesión
+secrets/
+.browser-profile/
+.browser-profile_validate/
+.env
+set-env.ps1
+*.p12
+*.pfx
+*.pem
+*.key
+cookies.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
