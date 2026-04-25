@@ -23,6 +23,7 @@ import hashlib
 import json
 import logging
 import os
+import subprocess
 import tempfile
 import time
 from contextlib import contextmanager
@@ -48,20 +49,74 @@ def make_tenant_id(env: str, user_code: str, company_code: str) -> str:
     return hashlib.sha256(raw).hexdigest()[:16]
 
 
-@contextmanager
-def _temp_cert_file(p12_bytes: bytes):
-    """Escribe el .p12 en disco temporalmente. Garantiza limpieza al salir."""
-    fd, path = tempfile.mkstemp(suffix=".p12", prefix="dian_cert_")
+def _modernize_p12(orig_path: str, password: str, modern_path: str, pem_path: str) -> bool:
+    """Convierte un .p12 legacy (RC2/3DES+SHA1) a moderno (AES-256).
+
+    OpenSSL 3 (y por tanto Playwright/Chromium) no carga los .p12 que la DIAN
+    suele entregar. Esta conversión es transparente: si el .p12 ya era moderno
+    también funciona porque OpenSSL acepta el flag -legacy en ambos casos.
+
+    Devuelve True si la conversión tuvo éxito.
+    """
     try:
-        with os.fdopen(fd, "wb") as f:
+        r1 = subprocess.run(
+            ["openssl", "pkcs12", "-in", orig_path, "-nodes", "-legacy",
+             "-passin", f"pass:{password}", "-out", pem_path],
+            capture_output=True, timeout=30,
+        )
+        if r1.returncode != 0:
+            log.warning("openssl extract falló: %s", r1.stderr.decode(errors="replace")[:200])
+            return False
+
+        r2 = subprocess.run(
+            ["openssl", "pkcs12", "-export", "-in", pem_path, "-out", modern_path,
+             "-passin", f"pass:{password}", "-passout", f"pass:{password}"],
+            capture_output=True, timeout=30,
+        )
+        if r2.returncode != 0:
+            log.warning("openssl export falló: %s", r2.stderr.decode(errors="replace")[:200])
+            return False
+
+        os.chmod(modern_path, 0o600)
+        return True
+    except FileNotFoundError:
+        log.error("openssl no está instalado en el sistema")
+        return False
+    except subprocess.TimeoutExpired:
+        log.error("openssl timeout al modernizar el .p12")
+        return False
+
+
+@contextmanager
+def _temp_cert_file(p12_bytes: bytes, password: str):
+    """Escribe el .p12 en disco temporalmente, modernizándolo si es legacy.
+
+    Garantiza limpieza al salir (incluso si Playwright lanza).
+    """
+    fd_orig, orig_path = tempfile.mkstemp(suffix=".p12", prefix="dian_cert_orig_")
+    fd_modern, modern_path = tempfile.mkstemp(suffix=".p12", prefix="dian_cert_modern_")
+    fd_pem, pem_path = tempfile.mkstemp(suffix=".pem", prefix="dian_cert_pem_")
+    os.close(fd_modern)
+    os.close(fd_pem)
+
+    try:
+        with os.fdopen(fd_orig, "wb") as f:
             f.write(p12_bytes)
-        os.chmod(path, 0o600)
-        yield path
+        os.chmod(orig_path, 0o600)
+
+        # Intentar modernizar — el flag -legacy de openssl también lee p12 modernos
+        if _modernize_p12(orig_path, password, modern_path, pem_path):
+            log.info("Cert .p12 convertido a formato moderno (AES-256)")
+            yield modern_path
+        else:
+            log.warning("No se pudo modernizar el .p12; usando original (puede fallar en Playwright)")
+            yield orig_path
     finally:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+        for p in (orig_path, modern_path, pem_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
 
 
 @dataclass
@@ -226,7 +281,7 @@ class TenantManager:
             base_cert     = URLS[env]["cert"]
             user_data_dir = self._profile_dir(tenant_id)
 
-            with _temp_cert_file(p12_bytes) as cert_path:
+            with _temp_cert_file(p12_bytes, cert_password) as cert_path:
                 async with async_playwright() as p:
                     cookies = await _login_with_capsolver(
                         p, env, base_catalogo, base_cert,
