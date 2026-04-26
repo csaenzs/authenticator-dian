@@ -79,14 +79,28 @@ Todos requieren header `X-API-Key: <SERVICE_API_KEY>` excepto `/health`.
 `reason` indica qué hizo el servicio: `cache_recent_42s`, `validated_http`,
 `validated_browser`, `full_login`, `force_refresh`.
 
-## Instalación en Linux (Debian/Ubuntu)
+## Requisitos previos
+
+- **Python ≥ 3.9** — `patchright` requiere mínimo 3.9. Ubuntu 20.04 trae 3.8;
+  ver [Instalación en Ubuntu 20.04](#instalación-en-ubuntu-2004).
+- **OpenSSL ≥ 3.0** — el flag `-legacy` de `openssl pkcs12` (que el servicio
+  usa para modernizar certificados `.p12` viejos) solo existe en OpenSSL 3.x.
+  Ubuntu 20.04 trae 1.1.1; en ese caso compilar 3.x aparte.
+- **Google Chrome** — patchright usa `channel="chrome"` (Chrome real, no
+  chromium-headless-shell). El instalador lo descarga vía `patchright install
+  chrome`.
+- **build-essential, perl, zlib1g-dev** — solo si vas a compilar OpenSSL 3.
+
+## Instalación en Linux (Debian/Ubuntu 22.04+ / Debian 12+)
+
+Sistemas modernos donde Python ≥ 3.9 y OpenSSL ≥ 3.0 ya vienen de fábrica:
 
 ```bash
 # 1. Clonar el repo
 sudo git clone <repo-url> /opt/tokendian
 cd /opt/tokendian
 
-# 2. Ejecutar instalador (instala Python, deps, Chromium, crea unit systemd)
+# 2. Ejecutar instalador (instala deps, Chrome real, crea unit systemd)
 sudo bash install-linux.sh
 
 # 3. Configurar
@@ -106,7 +120,89 @@ curl http://127.0.0.1:8765/health
 ```
 
 El servicio escucha en `127.0.0.1:8765` por defecto. Para exponerlo a otra
-máquina, ponle Nginx delante con TLS.
+máquina, ponle Nginx/Apache delante con TLS — ver [Exponer en LAN](#exponer-en-lan-con-reverse-proxy).
+
+## Instalación en Ubuntu 20.04
+
+Ubuntu 20.04 (focal) trae Python 3.8 y OpenSSL 1.1.1, que **no son
+suficientes**. Hay que instalar Python 3.11 y OpenSSL 3 manualmente. Estos
+pasos **no destruyen** los binarios de fábrica — todo queda en paths
+paralelos (`/opt/uv-python`, `/opt/openssl3`).
+
+### 1. Python 3.11 vía uv
+
+El PPA `deadsnakes` ya no publica para focal (focal llegó a EOL). Lo más
+limpio es usar `uv` (Astral), que descarga builds estándar de Python:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+mkdir -p /opt/uv-python
+UV_PYTHON_INSTALL_DIR=/opt/uv-python /root/.local/bin/uv python install 3.11
+chmod -R o+rX /opt/uv-python   # para que el usuario 'tokendian' pueda leerlo
+```
+
+Verifica:
+```bash
+ls /opt/uv-python/cpython-3.11-linux-x86_64-gnu/bin/python3.11
+```
+
+### 2. OpenSSL 3 desde fuente
+
+```bash
+sudo apt-get install -y build-essential perl zlib1g-dev
+cd /tmp
+curl -LO https://www.openssl.org/source/openssl-3.0.15.tar.gz
+tar xzf openssl-3.0.15.tar.gz && cd openssl-3.0.15
+./Configure linux-x86_64 --prefix=/opt/openssl3 --openssldir=/opt/openssl3 shared zlib
+make -j$(nproc)
+sudo make install_sw   # solo binarios + libs (sin manpages)
+
+# Registra la lib en el linker dinámico (no rompe OpenSSL 1.1: filenames
+# distintos: libssl.so.1.1 vs libssl.so.3)
+echo "/opt/openssl3/lib64" | sudo tee /etc/ld.so.conf.d/openssl3.conf
+sudo ldconfig
+```
+
+Verifica:
+```bash
+/opt/openssl3/bin/openssl version
+# OpenSSL 3.0.15 ...
+/opt/openssl3/bin/openssl pkcs12 -help 2>&1 | grep legacy
+# -legacy             Use legacy encryption: 3DES_CBC for keys, RC2_CBC for certs
+```
+
+### 3. Ejecutar el instalador apuntando al Python 3.11
+
+```bash
+sudo git clone <repo-url> /opt/tokendian
+cd /opt/tokendian
+
+export PYTHON_BIN=/opt/uv-python/cpython-3.11-linux-x86_64-gnu/bin/python3.11
+sudo PYTHON_BIN="$PYTHON_BIN" bash install-linux.sh
+```
+
+### 4. Decirle al servicio que use OpenSSL 3
+
+Edita `/etc/systemd/system/tokendian.service` y añade dentro de `[Service]`:
+
+```ini
+Environment="PATH=/opt/openssl3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="LD_LIBRARY_PATH=/opt/openssl3/lib64"
+```
+
+Y añade a `ReadWritePaths` los directorios que Chrome necesita para su
+crashpad (sin esto Chrome muere al arrancar bajo systemd con `ProtectSystem=strict`):
+
+```ini
+ReadWritePaths=/opt/tokendian/sessions /opt/tokendian/.browser-profiles /opt/tokendian/.config /opt/tokendian/.cache /tmp
+```
+
+Recarga y arranca:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now tokendian
+curl http://127.0.0.1:8765/health
+```
 
 ## Configuración (`.env`)
 
@@ -208,6 +304,80 @@ export DIAN_COMPANY_CODE=9015591465
 export CAPSOLVER_API_KEY=CSAPI-...
 python dian_login.py
 ```
+
+## Exponer en LAN con reverse proxy
+
+Por seguridad, el servicio escucha solo en `127.0.0.1:8765`. Para que
+clientes en otra máquina lo consuman, ponle un reverse proxy delante.
+
+### Ejemplo con Apache
+
+Habilita los módulos necesarios y crea un vhost:
+
+```bash
+sudo a2enmod proxy proxy_http headers
+```
+
+`/etc/apache2/sites-available/tokendian.conf`:
+
+```apache
+<VirtualHost *:80>
+    ServerName tokendian.local
+
+    ProxyRequests Off
+    ProxyPreserveHost On
+    ProxyTimeout 120
+
+    RequestHeader set X-Forwarded-Proto "http"
+    RequestHeader set X-Real-IP "%{REMOTE_ADDR}s"
+
+    ProxyPass        / http://127.0.0.1:8765/
+    ProxyPassReverse / http://127.0.0.1:8765/
+
+    ErrorLog  ${APACHE_LOG_DIR}/tokendian-error.log
+    CustomLog ${APACHE_LOG_DIR}/tokendian-access.log combined
+</VirtualHost>
+```
+
+```bash
+sudo a2ensite tokendian.conf
+sudo systemctl reload apache2
+```
+
+### Ejemplo con Nginx
+
+`/etc/nginx/sites-available/tokendian`:
+
+```nginx
+server {
+    listen 80;
+    server_name tokendian.local;
+
+    location / {
+        proxy_pass         http://127.0.0.1:8765;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_read_timeout 120s;
+    }
+}
+```
+
+```bash
+sudo ln -s /etc/nginx/sites-available/tokendian /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+### Recomendaciones
+
+- **TLS**: en LAN privada con IP interna no aplica Let's Encrypt; usa cert
+  auto-firmado o tu CA interna. Añade `listen 443 ssl;` (nginx) o `<VirtualHost
+  *:443>` con `SSLEngine on` (apache).
+- **Restricción por IP**: si solo una máquina debe consumir, agrega
+  `Require ip 192.168.10.0/24` (apache) o `allow 192.168.10.0/24; deny all;`
+  (nginx).
+- **Firewall**: `ufw allow from 192.168.10.0/24 to any port 80`.
 
 ## Licencia
 
