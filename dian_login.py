@@ -289,13 +289,33 @@ async def _login_with_capsolver(
         if not page.url.startswith(base_cert):
             raise DianLoginRejected(f"Redirección inesperada. URL final: {page.url}")
 
-        await page.goto(f"{base_cert}/", wait_until="domcontentloaded", timeout=20000)
+        # PARCHE LOCAL: networkidle (no domcontentloaded). El submit del form
+        # de login dispara una cadena de redirects (catalogo → certificate →
+        # certificate/User/Authenticated → ...) que con domcontentloaded se
+        # interrumpe a medio camino, dejando la sesión en estado inconsistente.
+        # networkidle espera ~500ms sin requests, capturando todos los redirects.
+        # Le damos un pequeño buffer extra para cookies HttpOnly que se setean
+        # tras el último redirect.
+        await page.goto(f"{base_cert}/", wait_until="networkidle", timeout=30000)
+        await page.wait_for_timeout(500)
         if "/User/Login" in page.url or "/User/CertificateLogin" in page.url:
             raise DianLoginRejected(
                 f"Sesión no quedó establecida. Tras visitar dashboard redirigió a login: {page.url}"
             )
 
-        return await context.cookies()
+        # Doble check: verificar que la cookie de auth (.AspNet.ApplicationCookie)
+        # haya sido emitida. Hay casos donde DIAN responde 200 en base_cert/ sin
+        # haber establecido sesión real (anti-bot silencioso, edge case en handoff).
+        # Sin este check, devolveríamos cookies incompletas y los consumidores
+        # quedarían en loop: validan cache (existe), llaman al endpoint, reciben
+        # 302 a /User/Login, no se auto-recuperan.
+        cookies = await context.cookies()
+        if not any(c.get("name") == ".AspNet.ApplicationCookie" for c in cookies):
+            raise DianLoginRejected(
+                "Login completó (URL OK) pero DIAN no emitió .AspNet.ApplicationCookie. "
+                "Posible rate-limit, anti-bot o sesión rechazada silenciosamente."
+            )
+        return cookies
     finally:
         await context.close()
 
