@@ -146,6 +146,36 @@ if [ -n "$APIDIAN_ENV" ]; then
             echo "TOKENDIAN_TIMEOUT=90" >> "$APIDIAN_ENV"
         fi
         echo "    TOKENDIAN_URL/API_KEY/TIMEOUT escritos en $APIDIAN_ENV"
+
+        # ── Pre-crear el directorio de cookies que apidian necesita escribir ──
+        # Si no existe + el proceso PHP (www-data) no puede crearlo en runtime,
+        # la primera consulta falla con "file_put_contents: No such file or directory".
+        # Mejor crearlo acá con perms correctos antes que dejarlo lazy.
+        APIDIAN_DIR=$(dirname "$APIDIAN_ENV")
+        APIDIAN_COOKIES_DIR="$APIDIAN_DIR/storage/app/dian_cookies"
+        if [ -d "$APIDIAN_DIR/storage/app" ]; then
+            mkdir -p "$APIDIAN_COOKIES_DIR"
+            # Detectar usuario web (Ubuntu/Debian = www-data por defecto).
+            WEB_USER="www-data"
+            if id "nginx" &>/dev/null && ! id "www-data" &>/dev/null; then
+                WEB_USER="nginx"
+            fi
+            chown -R "$WEB_USER:$WEB_USER" "$APIDIAN_COOKIES_DIR" 2>/dev/null || true
+            chmod 775 "$APIDIAN_COOKIES_DIR"
+            echo "    Directorio de cookies de apidian creado: $APIDIAN_COOKIES_DIR (owner=$WEB_USER)"
+        else
+            echo "    AVISO: $APIDIAN_DIR/storage/app no existe — apidian creará el dir de cookies en runtime."
+        fi
+
+        # ── Refrescar config cache de Laravel ─────────────────────────────────
+        # Laravel cachea config (incluyendo TOKENDIAN_API_KEY) durante el install.
+        # Si tokendian se instala DESPUÉS de ese cache, las nuevas vars no toman
+        # efecto hasta el próximo deploy. config:clear las refresca ya.
+        if [ -f "$APIDIAN_DIR/artisan" ]; then
+            echo "    Refrescando config cache de Laravel (apidian)..."
+            (cd "$APIDIAN_DIR" && php artisan config:clear 2>&1 | head -3) || \
+                echo "    AVISO: config:clear falló. Hacelo a mano: cd $APIDIAN_DIR && php artisan config:clear"
+        fi
     fi
 fi
 
