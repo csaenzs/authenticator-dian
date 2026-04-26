@@ -1,16 +1,50 @@
 #!/usr/bin/env bash
 # Instalación del servicio tokendian en Linux (Debian/Ubuntu).
-# Ejecutar como root: sudo bash install-linux.sh
+# Ejecutar como root: sudo bash install-linux.sh [opciones]
 #
-# Requisitos previos:
-#   - Python 3.9 o superior  (Ubuntu 20.04 trae 3.8: ver README)
-#   - OpenSSL 3.x            (Ubuntu 20.04 trae 1.1.1: ver README)
-#   - build-essential         (para algunos wheels nativos de Python)
+# Requisitos previos del sistema:
+#   - Python >= 3.9   (Ubuntu 22.04+ trae 3.10; 24.04 trae 3.12)
+#   - OpenSSL >= 3.0  (Ubuntu 22.04+ trae 3.0+ de fábrica)
+#   - build-essential (para algunos wheels nativos)
+#
+# Si vienes desde Ubuntu 20.04 (focal), usa los pasos manuales del README
+# ("Instalación en Ubuntu 20.04") antes de correr este script.
+#
+# Opciones:
+#   --auto-key             Genera un SERVICE_API_KEY aleatorio y escribe el .env.
+#                          Si se omite, deja al usuario crearlo manualmente.
+#   --apidian-env <ruta>   Escribe TOKENDIAN_URL/TOKENDIAN_API_KEY en el .env
+#                          de apidian (típicamente /var/www/html/apidian/.env).
+#                          Útil cuando este script lo invoca el instalador de apidian.
+#   --start                Arranca el servicio al final (systemctl enable --now).
+#   --help                 Muestra esta ayuda.
 set -euo pipefail
 
 INSTALL_DIR="/opt/tokendian"
 SERVICE_USER="tokendian"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+# Defaults de los flags
+AUTO_KEY=false
+APIDIAN_ENV=""
+START_SERVICE=false
+
+# Parseo de flags
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --auto-key)        AUTO_KEY=true; shift ;;
+        --apidian-env)     APIDIAN_ENV="$2"; shift 2 ;;
+        --start)           START_SERVICE=true; shift ;;
+        --help|-h)
+            sed -n '2,/^set/p' "$0" | sed 's/^# \?//' | head -n -1
+            exit 0
+            ;;
+        *)
+            echo "ERROR: flag desconocido '$1'. Usa --help."
+            exit 1
+            ;;
+    esac
+done
 
 echo "==> Verificando requisitos previos"
 
@@ -18,25 +52,22 @@ echo "==> Verificando requisitos previos"
 if ! "$PYTHON_BIN" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' 2>/dev/null; then
     PY_VERSION=$("$PYTHON_BIN" --version 2>&1 || echo "no encontrado")
     echo "ERROR: $PYTHON_BIN reporta '$PY_VERSION'. Se requiere Python >= 3.9."
-    echo "       En Ubuntu 20.04 (Python 3.8) instala 3.11 con uv:"
-    echo "         curl -LsSf https://astral.sh/uv/install.sh | sh"
-    echo "         uv python install --install-dir /opt/uv-python 3.11"
-    echo "         export PYTHON_BIN=/opt/uv-python/cpython-3.11-linux-x86_64-gnu/bin/python3.11"
-    echo "       Luego re-ejecuta este script."
+    echo "       Si estás en Ubuntu 20.04, ver sección 'Instalación en Ubuntu 20.04'"
+    echo "       del README — requiere instalar Python 3.11 vía uv antes."
     exit 1
 fi
 
-# OpenSSL >= 3.0 (warning, no error: el .p12 modernizado por el usuario podría
-# pasar igual; solo advertimos del posible fallo en certs legacy)
+# OpenSSL >= 3.0
 OPENSSL_VER=$(openssl version 2>/dev/null | awk '{print $2}' || echo "")
 case "$OPENSSL_VER" in
     3.*) ;;
     *)
-        echo "AVISO: openssl version='$OPENSSL_VER'. Se recomienda OpenSSL >= 3.0"
-        echo "      para que el servicio modernice automáticamente certificados"
-        echo "      .p12 legacy. En Ubuntu 20.04 conviene compilar 3.x aparte"
-        echo "      en /opt/openssl3 y exponerlo al servicio vía systemd"
-        echo "      'Environment=PATH=/opt/openssl3/bin:...' (ver README)."
+        echo "ERROR: openssl version='$OPENSSL_VER'. Se requiere OpenSSL >= 3.0"
+        echo "       para que el flag '-legacy' de pkcs12 funcione (necesario para"
+        echo "       modernizar certificados .p12 que la DIAN entrega en formato viejo)."
+        echo "       Si estás en Ubuntu 20.04, ver sección 'Instalación en Ubuntu 20.04'"
+        echo "       del README — requiere compilar OpenSSL 3 aparte."
+        exit 1
         ;;
 esac
 
@@ -71,19 +102,85 @@ echo "==> Instalando unit systemd"
 cp "$INSTALL_DIR/tokendian.service" /etc/systemd/system/tokendian.service
 systemctl daemon-reload
 
+# ─── Configuración automática del .env ──────────────────────────────────────
+if [ "$AUTO_KEY" = "true" ]; then
+    echo "==> Generando .env con SERVICE_API_KEY automático"
+    if [ ! -f "$INSTALL_DIR/.env" ]; then
+        cp "$INSTALL_DIR/.env.example" "$INSTALL_DIR/.env"
+    fi
+    SERVICE_API_KEY=$(openssl rand -hex 32)
+    if grep -q "^SERVICE_API_KEY=" "$INSTALL_DIR/.env"; then
+        sed -i "s|^SERVICE_API_KEY=.*|SERVICE_API_KEY=${SERVICE_API_KEY}|" "$INSTALL_DIR/.env"
+    else
+        echo "SERVICE_API_KEY=${SERVICE_API_KEY}" >> "$INSTALL_DIR/.env"
+    fi
+    chmod 600 "$INSTALL_DIR/.env"
+    chown "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR/.env"
+    echo "    SERVICE_API_KEY generado: ${SERVICE_API_KEY:0:8}... (guardado en $INSTALL_DIR/.env)"
+fi
+
+# ─── Sincronización con apidian ────────────────────────────────────────────
+if [ -n "$APIDIAN_ENV" ]; then
+    if [ ! -f "$APIDIAN_ENV" ]; then
+        echo "AVISO: --apidian-env apuntó a '$APIDIAN_ENV' pero no existe el archivo."
+        echo "       Salto este paso. Configura TOKENDIAN_API_KEY manualmente en apidian."
+    elif [ "$AUTO_KEY" != "true" ]; then
+        echo "AVISO: --apidian-env requiere también --auto-key (sin SERVICE_API_KEY"
+        echo "       generado no hay nada que sincronizar). Salto este paso."
+    else
+        echo "==> Sincronizando TOKENDIAN_* en apidian's .env: $APIDIAN_ENV"
+        # TOKENDIAN_URL
+        if grep -q "^TOKENDIAN_URL=" "$APIDIAN_ENV"; then
+            sed -i "s|^TOKENDIAN_URL=.*|TOKENDIAN_URL=http://127.0.0.1:8765|" "$APIDIAN_ENV"
+        else
+            echo "TOKENDIAN_URL=http://127.0.0.1:8765" >> "$APIDIAN_ENV"
+        fi
+        # TOKENDIAN_API_KEY (mismo valor que SERVICE_API_KEY)
+        if grep -q "^TOKENDIAN_API_KEY=" "$APIDIAN_ENV"; then
+            sed -i "s|^TOKENDIAN_API_KEY=.*|TOKENDIAN_API_KEY=${SERVICE_API_KEY}|" "$APIDIAN_ENV"
+        else
+            echo "TOKENDIAN_API_KEY=${SERVICE_API_KEY}" >> "$APIDIAN_ENV"
+        fi
+        # TOKENDIAN_TIMEOUT
+        if ! grep -q "^TOKENDIAN_TIMEOUT=" "$APIDIAN_ENV"; then
+            echo "TOKENDIAN_TIMEOUT=90" >> "$APIDIAN_ENV"
+        fi
+        echo "    TOKENDIAN_URL/API_KEY/TIMEOUT escritos en $APIDIAN_ENV"
+    fi
+fi
+
+# ─── Arranque opcional ─────────────────────────────────────────────────────
+if [ "$START_SERVICE" = "true" ]; then
+    echo "==> Habilitando y arrancando el servicio"
+    systemctl enable --now tokendian
+    sleep 2
+    if systemctl is-active --quiet tokendian; then
+        echo "    tokendian.service activo. Verificando /health..."
+        sleep 1
+        curl -sf http://127.0.0.1:8765/health && echo || echo "    /health no respondió. Revisa: journalctl -u tokendian -n 50"
+    else
+        echo "    ERROR: el servicio no arrancó. Revisa: journalctl -u tokendian -n 50"
+        exit 1
+    fi
+fi
+
 echo
-echo "==> Listo. Ahora:"
-echo "   1. Copia .env.example a .env y rellena SERVICE_API_KEY:"
-echo "        cp $INSTALL_DIR/.env.example $INSTALL_DIR/.env"
-echo "        # genera un API key largo:"
-echo "        echo \"SERVICE_API_KEY=\$(openssl rand -hex 32)\" >> $INSTALL_DIR/.env"
-echo "        chmod 600 $INSTALL_DIR/.env"
-echo "        chown $SERVICE_USER:$SERVICE_USER $INSTALL_DIR/.env"
-echo "   2. Arranca el servicio:"
-echo "        systemctl enable --now tokendian"
-echo "        systemctl status tokendian"
-echo "   3. Verifica que responde:"
-echo "        curl http://127.0.0.1:8765/health"
+echo "==> Instalación completa."
+
+if [ "$AUTO_KEY" != "true" ]; then
+    echo "Próximos pasos manuales:"
+    echo "   1. Configura .env y SERVICE_API_KEY:"
+    echo "        cp $INSTALL_DIR/.env.example $INSTALL_DIR/.env"
+    echo "        echo \"SERVICE_API_KEY=\$(openssl rand -hex 32)\" >> $INSTALL_DIR/.env"
+    echo "        chmod 600 $INSTALL_DIR/.env"
+    echo "        chown $SERVICE_USER:$SERVICE_USER $INSTALL_DIR/.env"
+    echo "   2. systemctl enable --now tokendian"
+fi
+
+if [ "$START_SERVICE" != "true" ]; then
+    echo "   Arranca con: systemctl enable --now tokendian"
+fi
+
 echo
 echo "Las credenciales DIAN (cert, password, NIT, cédula, CapSolver key)"
 echo "las envía el cliente en cada /auth/login. NO se guardan en el server."

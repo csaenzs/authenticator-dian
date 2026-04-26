@@ -1,0 +1,28 @@
+# Datos runtime — NUNCA al image build
+sessions/
+.browser-profiles/
+.cache/
+.config/
+.local/
+.venv/
+
+# Secrets / dev
+.env
+*.env.local
+secrets/
+
+# Backups y debug
+*.bak
+*.bak.*
+_debug_*
+
+# Git
+.git/
+.gitignore
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.pyc
+__pycache__/

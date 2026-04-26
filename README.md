@@ -46,8 +46,8 @@ Todos requieren header `X-API-Key: <SERVICE_API_KEY>` excepto `/health`.
 {
   "certificado_base64": "MIIK...",
   "certificado_password": "secreto",
-  "user_code": "1117488256",
-  "company_code": "9015591465",
+  "user_code": "1234567890",
+  "company_code": "9001234567",
   "id_type": "10910094",
   "env": "hab",
   "capsolver_api_key": "CSAPI-..."
@@ -91,13 +91,23 @@ Todos requieren header `X-API-Key: <SERVICE_API_KEY>` excepto `/health`.
   chrome`.
 - **build-essential, perl, zlib1g-dev** — solo si vas a compilar OpenSSL 3.
 
-## Instalación en Linux (Debian/Ubuntu 22.04+ / Debian 12+)
+## Instalación
+
+Tres caminos según tu escenario:
+
+| Escenario | Cómo |
+|---|---|
+| Estás instalando **apidian** y quieres tokendian junto | `InstallAPILAMP.sh` o `InstallAPIDocker.sh` de apidian te preguntan al final si querés instalarlo. Más info en el README de apidian. |
+| Querés tokendian **standalone** en LAMP/bare metal | Sección [Instalación en Linux](#instalación-en-linux-debianubuntu-2204--debian-12) más abajo |
+| Querés tokendian en **Docker** standalone | Sección [Instalación con Docker](#instalación-con-docker) más abajo |
+
+### Instalación en Linux (Debian/Ubuntu 22.04+ / Debian 12+)
 
 Sistemas modernos donde Python ≥ 3.9 y OpenSSL ≥ 3.0 ya vienen de fábrica:
 
 ```bash
 # 1. Clonar el repo
-sudo git clone <repo-url> /opt/tokendian
+sudo git clone https://github.com/csaenzs/authenticator-dian.git /opt/tokendian
 cd /opt/tokendian
 
 # 2. Ejecutar instalador (instala deps, Chrome real, crea unit systemd)
@@ -122,7 +132,57 @@ curl http://127.0.0.1:8765/health
 El servicio escucha en `127.0.0.1:8765` por defecto. Para exponerlo a otra
 máquina, ponle Nginx/Apache delante con TLS — ver [Exponer en LAN](#exponer-en-lan-con-reverse-proxy).
 
-## Instalación en Ubuntu 20.04
+#### Opciones de `install-linux.sh`
+
+```
+sudo bash install-linux.sh [--auto-key] [--apidian-env <ruta>] [--start]
+```
+
+| Flag | Qué hace |
+|---|---|
+| `--auto-key` | Genera un `SERVICE_API_KEY` aleatorio y lo escribe en `.env`. Si se omite, hay que crear el `.env` manualmente. |
+| `--apidian-env <ruta>` | Escribe `TOKENDIAN_URL` y `TOKENDIAN_API_KEY` en el `.env` de apidian. Útil cuando este script lo invoca el instalador de apidian. Requiere `--auto-key` también. |
+| `--start` | Habilita y arranca el servicio al final (`systemctl enable --now tokendian`). |
+
+Ejemplo "todo en uno" para integrar con apidian instalado en `/var/www/html/apidian`:
+```bash
+sudo bash install-linux.sh --auto-key \
+                           --apidian-env /var/www/html/apidian/.env \
+                           --start
+```
+
+### Instalación con Docker
+
+Construye la imagen y levantá el contenedor:
+
+```bash
+git clone https://github.com/csaenzs/authenticator-dian.git tokendian
+cd tokendian
+docker build -t tokendian:latest .
+
+docker run -d --name tokendian \
+  -p 127.0.0.1:8765:8765 \
+  -e SERVICE_API_KEY=$(openssl rand -hex 32) \
+  -e HEADLESS=true \
+  -e VALIDATION_TTL_SECONDS=1200 \
+  -v tokendian_sessions:/opt/tokendian/sessions \
+  -v tokendian_profiles:/opt/tokendian/.browser-profiles \
+  --restart unless-stopped \
+  tokendian:latest
+```
+
+Volúmenes persistidos:
+- `tokendian_sessions`: cache de cookies por tenant. Sobrevive a `docker restart`.
+- `tokendian_profiles`: perfiles de Chrome por tenant.
+
+Si vas a integrar con apidian-Docker, tokendian se monta como otro servicio en
+`docker-compose.yml`. Ver el README de apidian.
+
+## Instalación en Ubuntu 20.04 (legacy)
+
+> ⚠️ Ubuntu 20.04 está al final de su vida. El instalador integrado de apidian
+> requiere Ubuntu 22.04+. Esta sección queda como referencia para deployments
+> antiguos que no pueden migrar.
 
 Ubuntu 20.04 (focal) trae Python 3.8 y OpenSSL 1.1.1, que **no son
 suficientes**. Hay que instalar Python 3.11 y OpenSSL 3 manualmente. Estos
@@ -299,8 +359,8 @@ O mantén el script Python en su modo CLI (compatibilidad con la versión 1.x):
 ```bash
 export DIAN_CERT_PATH=/ruta/cert-modern.p12
 export DIAN_CERT_PASSWORD=...
-export DIAN_USER_CODE=1117488256
-export DIAN_COMPANY_CODE=9015591465
+export DIAN_USER_CODE=1234567890
+export DIAN_COMPANY_CODE=9001234567
 export CAPSOLVER_API_KEY=CSAPI-...
 python dian_login.py
 ```
