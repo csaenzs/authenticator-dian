@@ -8,7 +8,18 @@ User=tokendian
 Group=tokendian
 WorkingDirectory=/opt/tokendian
 EnvironmentFile=/opt/tokendian/.env
-ExecStart=/opt/tokendian/.venv/bin/uvicorn server:app --host 127.0.0.1 --port 8765 --workers 1
+# Ubuntu 20.04: el openssl del sistema es 1.1.1 (sin flag -legacy) y no puede
+# modernizar los .p12 legacy de la DIAN. Apuntamos a un OpenSSL 3 instalado en
+# /opt/openssl3 (ver README, sección Ubuntu 20.04). En servidores con OpenSSL 3
+# de sistema (Ubuntu 22.04+) estas rutas no existen y se ignoran sin efecto.
+Environment="PATH=/opt/openssl3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="LD_LIBRARY_PATH=/opt/openssl3/lib64"
+# El navegador corre en modo HEADED (HEADLESS=false en .env): el WAF de Azure
+# que la DIAN puso delante de producción (catalogo-vpfe.dian.gov.co) detecta y
+# bloquea en duro al Chrome headless ("Solicitud bloqueada por controles de
+# seguridad"), pero deja pasar a un Chrome real que resuelve su JS Challenge.
+# Como no hay display físico en el server, lo damos con Xvfb (display virtual).
+ExecStart=/usr/bin/xvfb-run -a --server-args="-screen 0 1920x1080x24 -ac -nolisten tcp" /opt/tokendian/.venv/bin/uvicorn server:app --host 127.0.0.1 --port 8765 --workers 1
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

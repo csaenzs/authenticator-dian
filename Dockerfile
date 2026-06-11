@@ -13,7 +13,7 @@
 #   docker run -d --name tokendian \
 #     -p 127.0.0.1:8765:8765 \
 #     -e SERVICE_API_KEY=$(openssl rand -hex 32) \
-#     -e HEADLESS=true \
+#     -e HEADLESS=false \
 #     -v tokendian_sessions:/opt/tokendian/sessions \
 #     -v tokendian_profiles:/opt/tokendian/.browser-profiles \
 #     tokendian:latest
@@ -32,12 +32,16 @@ ENV DEBIAN_FRONTEND=noninteractive \
 #   - openssl: para que el comando 'openssl pkcs12 -legacy' funcione (cert .p12 legacy)
 #   - curl/ca-certificates: para que Chrome+patchright descarguen
 #   - el resto: librerías que Chrome necesita (sin sandbox; corremos no-root)
+#   - xvfb: display virtual para correr Chrome HEADED. La DIAN puso producción
+#     detrás de un WAF de Azure que bloquea al Chrome headless; el navegador
+#     real bajo Xvfb sí pasa el JS Challenge.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         openssl \
         ca-certificates \
         curl \
         wget \
         gnupg \
+        xvfb \
     && rm -rf /var/lib/apt/lists/*
 
 # Crear usuario de servicio (no-root) — Chrome no permite correr como root sin --no-sandbox
@@ -83,4 +87,8 @@ EXPOSE 8765
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8765/health || exit 1
 
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8765", "--workers", "1"]
+# Arrancamos bajo Xvfb para que Chrome corra HEADED (necesario para el WAF de
+# Azure de la DIAN). El default de HEADLESS es false; el cliente igual puede
+# sobreescribirlo con -e HEADLESS=... si lo necesita.
+CMD ["xvfb-run", "-a", "--server-args=-screen 0 1920x1080x24 -ac -nolisten tcp", \
+     "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8765", "--workers", "1"]

@@ -349,7 +349,7 @@ async def login(
     id_type       = id_type       or os.getenv("DIAN_ID_TYPE", "10910094")
     capsolver_key = capsolver_key or os.environ["CAPSOLVER_API_KEY"]
     if headless is None:
-        headless = os.getenv("HEADLESS", "true").lower() == "true"
+        headless = os.getenv("HEADLESS", "false").lower() == "true"
     cookies_path  = cookies_path  or Path(os.getenv("COOKIES_PATH", str(DEFAULT_COOKIES)))
     user_data_dir = user_data_dir or os.getenv("BROWSER_PROFILE_DIR", DEFAULT_PROFILE)
 

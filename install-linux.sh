@@ -73,7 +73,10 @@ esac
 
 echo "==> Instalando dependencias del sistema..."
 apt-get update
-apt-get install -y python3-venv python3-pip openssl ca-certificates
+# xvfb: display virtual para correr Chrome en modo HEADED. La DIAN puso
+# producción detrás de un WAF de Azure que bloquea al Chrome headless; el
+# navegador real (bajo Xvfb) sí pasa el JS Challenge. Ver tokendian.service.
+apt-get install -y python3-venv python3-pip openssl ca-certificates xvfb
 
 echo "==> Creando usuario de servicio: $SERVICE_USER"
 if ! id "$SERVICE_USER" >/dev/null 2>&1; then

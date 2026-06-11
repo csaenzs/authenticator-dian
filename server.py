@@ -57,7 +57,7 @@ def _build_manager() -> TenantManager:
     return TenantManager(
         sessions_dir=sessions_dir,
         browser_profiles_root=profiles_root,
-        headless=os.getenv("HEADLESS", "true").lower() == "true",
+        headless=os.getenv("HEADLESS", "false").lower() == "true",
         validation_ttl_seconds=int(os.getenv("VALIDATION_TTL_SECONDS", "300")),
     )
 

@@ -89,7 +89,21 @@ Todos requieren header `X-API-Key: <SERVICE_API_KEY>` excepto `/health`.
 - **Google Chrome** — patchright usa `channel="chrome"` (Chrome real, no
   chromium-headless-shell). El instalador lo descarga vía `patchright install
   chrome`.
+- **Xvfb** — display virtual obligatorio. La DIAN puso producción detrás de un
+  WAF de Azure (JS Challenge) que **bloquea al Chrome headless**; solo un Chrome
+  HEADED (navegador real) resuelve el reto y pasa. Como el server no tiene
+  display físico, se corre bajo `xvfb-run` (ver [HEADLESS / Azure WAF](#headless--azure-waf-de-la-dian)).
+  El instalador lo trae con `apt-get install xvfb`.
 - **build-essential, perl, zlib1g-dev** — solo si vas a compilar OpenSSL 3.
+
+### HEADLESS / Azure WAF de la DIAN
+
+Desde ~junio 2026 la DIAN protege `catalogo-vpfe.dian.gov.co` con **Azure WAF**:
+un Chrome `--headless` recibe `403 "Solicitud bloqueada por controles de
+seguridad"` antes de ver el formulario. Por eso el servicio corre con
+`HEADLESS=false` y el navegador real se ejecuta sobre un display virtual Xvfb.
+El unit systemd ya arranca `uvicorn` con `xvfb-run`; en Docker el `CMD` hace lo
+mismo. Habilitación (`hab`) no tiene este WAF, pero headed funciona igual.
 
 ## Instalación
 
@@ -163,7 +177,7 @@ docker build -t tokendian:latest .
 docker run -d --name tokendian \
   -p 127.0.0.1:8765:8765 \
   -e SERVICE_API_KEY=$(openssl rand -hex 32) \
-  -e HEADLESS=true \
+  -e HEADLESS=false \
   -e VALIDATION_TTL_SECONDS=1200 \
   -v tokendian_sessions:/opt/tokendian/sessions \
   -v tokendian_profiles:/opt/tokendian/.browser-profiles \
@@ -243,12 +257,17 @@ sudo PYTHON_BIN="$PYTHON_BIN" bash install-linux.sh
 
 ### 4. Decirle al servicio que use OpenSSL 3
 
-Edita `/etc/systemd/system/tokendian.service` y añade dentro de `[Service]`:
+Estas dos líneas **ya vienen en `tokendian.service`** del repo, así que normalmente
+no hay que hacer nada. Solo verifica que apunten a donde instalaste OpenSSL 3
+(`/opt/openssl3` por convención) dentro de `[Service]`:
 
 ```ini
 Environment="PATH=/opt/openssl3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment="LD_LIBRARY_PATH=/opt/openssl3/lib64"
 ```
+
+Si tu OpenSSL 3 está en otra ruta, ajústalas. En Ubuntu 22.04+ (OpenSSL 3 de
+sistema) estas rutas no existen y se ignoran sin efecto — no hace falta tocarlas.
 
 Y añade a `ReadWritePaths` los directorios que Chrome necesita para su
 crashpad (sin esto Chrome muere al arrancar bajo systemd con `ProtectSystem=strict`):
@@ -269,7 +288,7 @@ curl http://127.0.0.1:8765/health
 | Variable | Descripción | Default |
 |---|---|---|
 | `SERVICE_API_KEY` | Token requerido en header `X-API-Key` | (requerido) |
-| `HEADLESS` | Si `true`, browser sin UI | `true` |
+| `HEADLESS` | Si `true`, browser sin UI. **Mantener en `false`**: el WAF de Azure de la DIAN bloquea al Chrome headless (correr bajo Xvfb) | `false` |
 | `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR` | `INFO` |
 | `VALIDATION_TTL_SECONDS` | Segundos sin re-validar la sesión | `300` |
 | `SESSIONS_DIR` | Carpeta para cookies persistidas | `/opt/tokendian/sessions` |
@@ -338,12 +357,14 @@ $bytes = [IO.File]::ReadAllBytes("cert-modern.p12")
 
 | Síntoma | Causa probable |
 |---|---|
-| `502 DianLoginRejected: ... cert, contraseña, NIT y cédula` | Datos incorrectos o `.p12` legacy sin convertir |
+| `502 DianLoginRejected: ... cert, contraseña, NIT y cédula` | Datos incorrectos o `.p12` legacy sin convertir. **En producción**, verificar también que `HEADLESS=false` y que el servicio corra bajo Xvfb: el WAF de Azure bloquea al Chrome headless (`403 "Solicitud bloqueada por controles de seguridad"`) y el login no llega ni al formulario |
 | `502 CapSolverError: createTask falló` | API key de CapSolver inválida o sin saldo |
 | `410 Gone: tenant_not_found` | Es la primera vez para ese cliente. Llama `/auth/login` |
 | `410 Gone: cloudflare_blocked` | Cloudflare rechazó la validación httpx. Reintenta — el servicio caerá a validación con browser |
 | `500 SERVICE_API_KEY no configurada` | Falta el `.env` o no se cargó al arrancar |
 | Login se cuelga en headless | Probar con `HEADLESS=false` localmente para ver qué pasa |
+| `403 "Solicitud bloqueada por controles de seguridad"` en prod | Azure WAF bloqueó al Chrome headless. Asegurar `HEADLESS=false` + `xvfb-run` (ver [HEADLESS / Azure WAF](#headless--azure-waf-de-la-dian)) |
+| `xvfb-run: command not found` al arrancar | Falta el paquete: `apt-get install xvfb` |
 
 ## Modo desarrollo / debug local
 
