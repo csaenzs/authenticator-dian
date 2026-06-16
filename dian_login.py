@@ -320,6 +320,74 @@ async def _login_with_capsolver(
         await context.close()
 
 
+# ---------- login por token_url (perfil contador, sin CapSolver) ----------
+
+def _is_dian_host(url: str) -> bool:
+    """True si la URL apunta a un host *.dian.gov.co (anti-SSRF: el endpoint
+    abre la URL en un navegador real, así que solo permitimos hosts de la DIAN)."""
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    return host == "dian.gov.co" or host.endswith(".dian.gov.co")
+
+
+async def _login_with_token_url(p, token_url: str, headless: bool, user_data_dir: str) -> list[dict]:
+    """Abre un token_url (AuthToken de un solo uso) en el navegador real.
+
+    Sirve para el perfil contador: la DIAN puso el portal de producción
+    (catalogo-vpfe) detrás de Azure WAF y el curl de apidian recibe 403. El
+    navegador resuelve el JS Challenge, consume el token y deja la sesión
+    (.AspNet.ApplicationCookie). No usa CapSolver ni certificado .p12.
+    """
+    context = await p.chromium.launch_persistent_context(
+        user_data_dir=user_data_dir,
+        channel="chrome",
+        headless=headless,
+        no_viewport=True,
+        locale="es-CO",
+        timezone_id="America/Bogota",
+    )
+    page = context.pages[0] if context.pages else await context.new_page()
+    try:
+        await page.goto(token_url, wait_until="domcontentloaded", timeout=45000)
+
+        # Tras el goto puede estar: (a) en el JS Challenge del WAF, (b) procesando
+        # el token, (c) ya en el dashboard. Poll hasta tener sesión o fallar.
+        last_url = page.url
+        for _ in range(15):
+            await page.wait_for_timeout(2000)
+            try:
+                content = (await page.content()).lower()
+            except Exception:
+                content = ""  # navegación en curso; reintenta
+            if "controles de seguridad" in content or "azure waf" in content:
+                continue  # aún resolviendo el challenge del WAF
+
+            cookies = await context.cookies()
+            if any(c.get("name") == ".AspNet.ApplicationCookie" for c in cookies):
+                return cookies
+
+            try:
+                last_url = page.url
+            except Exception:
+                last_url = last_url
+            low = last_url.lower()
+            if "/user/login" in low or "/user/certificatelogin" in low:
+                raise DianLoginRejected(
+                    f"El token_url no estableció sesión: redirigió a login ({last_url}). "
+                    "El token puede estar vencido o ya utilizado."
+                )
+
+        raise DianLoginRejected(
+            f"Timeout esperando la sesión tras abrir el token_url. URL final: {last_url}. "
+            "Posible WAF persistente o token inválido."
+        )
+    finally:
+        await context.close()
+
+
 # ---------- API pública ----------
 
 async def login(

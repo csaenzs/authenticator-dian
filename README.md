@@ -35,6 +35,7 @@ Todos requieren header `X-API-Key: <SERVICE_API_KEY>` excepto `/health`.
 | `GET` | `/health` | Ping (sin auth) |
 | `POST` | `/auth/login` | Login fresco con browser + CapSolver |
 | `POST` | `/auth/get_or_login` | Reusa cache si vive, sino login. **Endpoint recomendado** |
+| `POST` | `/auth/token_url` | Abre un `token_url` (perfil contador) en navegador para pasar el Azure WAF y devolver cookies. Sin CapSolver ni `.p12` |
 | `GET` | `/auth/cookies?tenant_id=X` | Lee cache. `410 Gone` si la sesión murió |
 | `GET` | `/auth/cookies/netscape?tenant_id=X` | Cookies en formato Netscape (cURL/PHP) |
 | `GET` | `/auth/status?tenant_id=X` | Estado sin tocar DIAN |

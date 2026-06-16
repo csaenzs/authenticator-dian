@@ -35,7 +35,9 @@ from patchright.async_api import async_playwright
 
 from dian_login import (
     URLS,
+    _is_dian_host,
     _login_with_capsolver,
+    _login_with_token_url,
     _validate_saved_cookies_browser,
     validate_cookies_http,
 )
@@ -299,6 +301,24 @@ class TenantManager:
             self._persist(t)
             log.info("Login completo exitoso (tenant=%s, count=%d)", tenant_id, t.login_count)
             return t
+
+    async def login_token_url(self, token_url: str) -> list[dict]:
+        """Abre un token_url (perfil contador) en el navegador para pasar el
+        Azure WAF y devolver las cookies de sesión.
+
+        No persiste estado de tenant: el token es de un solo uso y apidian ya
+        cachea el cookie jar con su propio TTL. Solo necesitamos el navegador
+        para sortear el WAF que bloquea al curl de PHP.
+        """
+        if not _is_dian_host(token_url):
+            raise ValueError(f"token_url no apunta a un host de la DIAN: {token_url!r}")
+
+        digest = hashlib.sha256(token_url.encode("utf-8")).hexdigest()[:16]
+        user_data_dir = str(self.browser_profiles_root / f"tokenurl_{digest}")
+        async with async_playwright() as p:
+            cookies = await _login_with_token_url(p, token_url, self.headless, user_data_dir)
+        log.info("token_url login exitoso (%d cookies)", len(cookies))
+        return cookies
 
     async def get_or_login(self, **login_kwargs) -> tuple[Tenant, str]:
         """Si la sesión cacheada vive, la devuelve. Sino hace login.

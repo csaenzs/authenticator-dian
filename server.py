@@ -122,6 +122,16 @@ class LoginResponse(BaseModel):
     cookie_count: int
 
 
+class TokenUrlRequest(BaseModel):
+    token_url: str = Field(..., description="URL AuthToken de un solo uso de la DIAN (perfil contador)")
+
+
+class TokenUrlResponse(BaseModel):
+    cookies: list[dict]
+    cookie_count: int
+    reason: str
+
+
 class StatusResponse(BaseModel):
     tenant_id: str
     env: str
@@ -233,6 +243,28 @@ async def auth_get_or_login(req: LoginRequest, mgr: TenantManager = Depends(get_
         cookies=t.cookies,
         reason=reason,
         cookie_count=len(t.cookies),
+    )
+
+
+@app.post("/auth/token_url", response_model=TokenUrlResponse, dependencies=[Depends(require_api_key)])
+async def auth_token_url(req: TokenUrlRequest, mgr: TenantManager = Depends(get_manager)):
+    """Abre un token_url (perfil contador) en el navegador headed para pasar el
+    Azure WAF de producción y devolver las cookies de sesión.
+
+    No usa CapSolver ni certificado: el token_url ya es una autenticación de un
+    solo uso; solo se necesita el navegador para sortear el WAF que bloquea al
+    curl de PHP. apidian persiste y reutiliza las cookies con su propio TTL.
+    """
+    try:
+        cookies = await mgr.login_token_url(req.token_url)
+    except Exception as e:
+        log.exception("token_url login falló")
+        raise _map_dian_errors(e)
+
+    return TokenUrlResponse(
+        cookies=cookies,
+        cookie_count=len(cookies),
+        reason="token_url_browser",
     )
 
 
