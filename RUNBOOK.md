@@ -71,6 +71,11 @@ lsb_release -rs ; openssl version          # ¿20.04? ¿openssl de sistema?
 - **22.04+** → no aplica, continúa tranquilo.
 
 ### Pasos 1-4 — Aplicar
+
+**En un solo comando (instalaciones existentes):** `sudo bash /opt/tokendian/update-linux.sh`
+hace todos los Pasos 1-4 de forma idempotente (pull + xvfb + fuerza HEADLESS=false
++ reinstala el unit + restart + health). Lo de abajo es el detalle manual equivalente.
+
 ```bash
 sudo -u tokendian git -C /opt/tokendian pull
 sudo apt-get install -y xvfb
