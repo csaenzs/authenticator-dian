@@ -300,7 +300,10 @@ async def _login_with_capsolver(
         await page.wait_for_timeout(500)
         if "/User/Login" in page.url or "/User/CertificateLogin" in page.url:
             raise DianLoginRejected(
-                f"Sesión no quedó establecida. Tras visitar dashboard redirigió a login: {page.url}"
+                f"Sesión no quedó establecida. Tras visitar dashboard redirigió a login: {page.url}. "
+                "El submit fue aceptado, así que el certificado y la contraseña están bien: "
+                "verifica que el representante legal y el usuario registrados ante la DIAN sigan "
+                "siendo los vigentes (caso EMSSANAR 2026-09-24, ver RUNBOOK §7)."
             )
 
         # Doble check: verificar que la cookie de auth (.AspNet.ApplicationCookie)
@@ -313,7 +316,9 @@ async def _login_with_capsolver(
         if not any(c.get("name") == ".AspNet.ApplicationCookie" for c in cookies):
             raise DianLoginRejected(
                 "Login completó (URL OK) pero DIAN no emitió .AspNet.ApplicationCookie. "
-                "Posible rate-limit, anti-bot o sesión rechazada silenciosamente."
+                "Revisa primero que el representante legal y el usuario registrados ante la "
+                "DIAN sean los vigentes; si lo son, queda rate-limit, anti-bot o sesión "
+                "rechazada silenciosamente (RUNBOOK §7)."
             )
         return cookies
     finally:

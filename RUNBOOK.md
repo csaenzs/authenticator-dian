@@ -117,8 +117,8 @@ Una consulta de **producción** (no habilitación) desde apidian. Si pasa, listo
 | `openssl ... Unrecognized flag legacy` | Está usando openssl 1.1.1 del sistema | Mismo que arriba: el proceso debe ver OpenSSL 3 |
 | `xvfb-run: command not found` | Falta el paquete | `apt-get install xvfb` |
 | `headless=True` en el log de arranque | El `.env` no se actualizó | `sed -i 's/^HEADLESS=.*/HEADLESS=false/' .env` + restart |
-| `DianLoginRejected: Sesión no quedó establecida. Tras visitar dashboard redirigió a login` | **No es rechazo del login** (ver §7): el submit pasó y la sesión se pierde en la navegación siguiente | §7 — perfil persistente, luego versiones |
-| `Login completó (URL OK) pero DIAN no emitió .AspNet.ApplicationCookie` | Misma causa que la fila anterior, cortando un paso más tarde | §7 |
+| `DianLoginRejected: Sesión no quedó establecida. Tras visitar dashboard redirigió a login` | **Lo más probable: el representante legal o el usuario registrado en la DIAN ya no es el vigente.** El submit pasa igual, así que el error no lo delata (ver §7) | Confirmar con el cliente quién es el representante vigente y actualizar los datos. Solo si eso está bien, §7 |
+| `Login completó (URL OK) pero DIAN no emitió .AspNet.ApplicationCookie` | Misma familia que la anterior, cortando un paso más tarde | §7 |
 
 ---
 
@@ -136,12 +136,30 @@ Una consulta de **producción** (no habilitación) desde apidian. Si pasa, listo
 
 ---
 
-## 7. Divergencia de versiones entre servidores (Chrome / patchright)
+## 7. Login rechazado tras un submit correcto
 
 Caso EMSSANAR, 2026-09-24: import DIAN fallando siempre, determinista, con
 `DianLoginRejected: Sesión no quedó establecida. Tras visitar dashboard redirigió
 a login`. Mismo commit de tokendian que un servidor que sí autentica. Descartados
 reloj, certificado y versión del repo.
+
+> **Resuelto el mismo día, y la causa no era técnica: la empresa había cambiado
+> de representante legal.** Actualizados los datos, el import funcionó a la
+> primera. Antes de llegar ahí se descartaron, midiendo:
+>
+> | Hipótesis | Cómo se probó | Resultado |
+> |---|---|---|
+> | Perfil persistente con estado viejo | perfil movido a `.bak-20260924` | **falló igual** |
+> | Versión de Chrome | `apt upgrade`: 147 → 154 | **falló igual** |
+> | patchright desactualizado | 1.59.1, muy por encima del piso del `requirements` | descartada |
+>
+> Coste de no haber empezado por ahí: dos días. **Preguntar primero si cambió el
+> representante legal, el usuario o los datos registrados ante la DIAN.** Es
+> gratis, y este error no lo distingue de un problema de infraestructura.
+
+Lo que sigue conserva el análisis técnico porque el mensaje es genuinamente
+ambiguo y la próxima vez puede no ser lo mismo — pero el orden de diagnóstico
+cambió.
 
 ### Leer bien el error antes de buscar culpables
 
@@ -188,6 +206,11 @@ donde entra el `.p12`.
 
 ### Orden de diagnóstico (de lo barato a lo caro)
 
+0. **¿Cambiaron los datos del cliente ante la DIAN?** Representante legal,
+   usuario asociado al certificado, cédula del firmante. Una llamada, cero
+   riesgo, y es la causa del único caso documentado de este error. El flujo la
+   atraviesa sin detectarla: la DIAN acepta el submit y recién niega la sesión
+   al entrar al dashboard, que es exactamente el síntoma de abajo.
 1. **Perfil persistente.** `auth_service.py:284` usa `launch_persistent_context`
    con un `user_data_dir` por tenant bajo `.browser-profiles`. Un perfil con
    cookies viejas reproduce este síntoma exacto, es determinista y **sobrevive a
@@ -198,7 +221,7 @@ donde entra el `.p12`.
    mv /opt/tokendian/.browser-profiles/<tenant> /opt/tokendian/.browser-profiles/<tenant>.bak
    systemctl start tokendian
    ```
-   Si pasa, no era versión de nada.
+   Si pasa, no era versión de nada. (En EMSSANAR **no** pasó.)
 2. **Censo de las dos máquinas** (la que falla y una que funcione):
    ```bash
    google-chrome --version
@@ -217,10 +240,24 @@ donde entra el `.p12`.
   tres meses es la firma rara. Que siga el estable, pero **sincronizado por el
   update**, no por azar.
 - Una diferencia de versión entre dos servidores es **correlación**, no causa,
-  mientras no se reproduzca. Si tras alinear Chrome el fallo sigue, la hipótesis
-  muere y el arreglo es en `dian_login.py`: reintentar el `goto` comprobando
+  mientras no se reproduzca. En este caso se alineó Chrome (147 → 154) y el
+  fallo siguió: la hipótesis murió. Sigue siendo cierto que nadie sincroniza
+  esas dos versiones y que eso hay que arreglarlo, pero no fue lo que rompió
+  EMSSANAR.
+- Si algún día el fallo persiste **con los datos de la DIAN ya verificados**, el
+  arreglo es en `dian_login.py`: reintentar el `goto` comprobando
   `.AspNet.ApplicationCookie` en `context.cookies()` entre intentos, en vez de
   confiar en `networkidle` + 500 ms. Determinista y sin depender del build.
+  Ojo con dónde: el comentario «PARCHE LOCAL» de `:364` describe una carrera en
+  la navegación del **submit**, pero el `networkidle` se aplicó al `goto`
+  siguiente; el `expect_navigation` del submit (`:349`) sigue en
+  `domcontentloaded`.
+- Para instrumentar el handoff sin tocar el flujo existe la rama
+  **`diag/login-handoff`** (commit `7428911`, 87 líneas insertadas y 0
+  borradas): registra la cadena de navegaciones, la URL y los **nombres** de
+  cookie tras el submit y tras el `goto`, y vuelca screenshot + HTML en los
+  puntos de fallo con `DIAN_DIAG=true`. No está mergeada a propósito — se aplica
+  solo si vuelve a aparecer un caso que no se explique por los datos del cliente.
 
 ### Lo que falta en los scripts
 
