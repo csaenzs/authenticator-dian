@@ -117,6 +117,8 @@ Una consulta de **producción** (no habilitación) desde apidian. Si pasa, listo
 | `openssl ... Unrecognized flag legacy` | Está usando openssl 1.1.1 del sistema | Mismo que arriba: el proceso debe ver OpenSSL 3 |
 | `xvfb-run: command not found` | Falta el paquete | `apt-get install xvfb` |
 | `headless=True` en el log de arranque | El `.env` no se actualizó | `sed -i 's/^HEADLESS=.*/HEADLESS=false/' .env` + restart |
+| `DianLoginRejected: Sesión no quedó establecida. Tras visitar dashboard redirigió a login` | **No es rechazo del login** (ver §7): el submit pasó y la sesión se pierde en la navegación siguiente | §7 — perfil persistente, luego versiones |
+| `Login completó (URL OK) pero DIAN no emitió .AspNet.ApplicationCookie` | Misma causa que la fila anterior, cortando un paso más tarde | §7 |
 
 ---
 
@@ -131,3 +133,103 @@ Una consulta de **producción** (no habilitación) desde apidian. Si pasa, listo
   certificado original.
 - Habilitación funciona con o sin estos cambios (headed funciona igual; headless
   también, porque hab no tiene el WAF).
+
+---
+
+## 7. Divergencia de versiones entre servidores (Chrome / patchright)
+
+Caso EMSSANAR, 2026-09-24: import DIAN fallando siempre, determinista, con
+`DianLoginRejected: Sesión no quedó establecida. Tras visitar dashboard redirigió
+a login`. Mismo commit de tokendian que un servidor que sí autentica. Descartados
+reloj, certificado y versión del repo.
+
+### Leer bien el error antes de buscar culpables
+
+Ese mensaje es `dian_login.py:301-304`, y para llegar ahí el flujo ya pasó dos
+guardas anteriores:
+
+- `:284` — `"/User/Login" in page.url or "/User/CertificateLogin" in page.url`
+  tras el submit. **No disparó.**
+- `:289` — `not page.url.startswith(base_cert)`. **No disparó.**
+
+Es decir: **certificado, Turnstile/CapSolver y submit funcionaron**, y la URL
+final ya estaba dentro de `base_cert`. Lo que falla es el **segundo**
+`goto(base_cert + "/")` de `:299`. La sesión se establece y se pierde en la
+navegación siguiente. No perder tiempo revisando cert, contraseña, NIT o
+CapSolver: el propio código ya los descartó.
+
+### Por qué ese paso depende del navegador
+
+```python
+await page.goto(f"{base_cert}/", wait_until="networkidle", timeout=30000)
+await page.wait_for_timeout(500)
+```
+
+El submit dispara una cadena de redirects (catálogo → certificate →
+certificate/User/Authenticated → …) y `.AspNet.ApplicationCookie` es HttpOnly y
+se emite tras el último. `networkidle` es una heurística de tiempo (~500 ms sin
+requests) y el buffer de 500 ms es fijo: **el corte cae en un momento distinto
+según el build del navegador**. Si cae antes de la cookie, el `goto` termina en
+`/User/Login` (`:303`); si cae justo después de la URL pero antes de la cookie,
+muere en el doble check de `:313`. Son dos ramas del mismo defecto.
+
+### Las dos versiones que divergen sin control
+
+| Componente | Quién la fija | Quién la actualiza |
+|---|---|---|
+| Google Chrome | `install-linux.sh:101` → `patchright install chrome` (instala el Chrome del sistema vía apt, por eso corre como root) | **nadie** — queda la del día de instalación o la del último `apt upgrade` |
+| patchright | `requirements.txt` → `patchright>=1.50.0`, **sin pin** | **nadie** — `update-linux.sh` no corre `pip install -r` |
+
+`update-linux.sh` hace pull, xvfb, `HEADLESS=false`, unit y restart: **ni Chrome
+ni venv**. Así que dos servidores instalados en fechas distintas corren código
+idéntico sobre pilas distintas, y nada lo delata. patchright pesa aquí tanto como
+Chrome: es quien implementa `client_certificates` (`dian_login.py:225-229`), por
+donde entra el `.p12`.
+
+### Orden de diagnóstico (de lo barato a lo caro)
+
+1. **Perfil persistente.** `auth_service.py:284` usa `launch_persistent_context`
+   con un `user_data_dir` por tenant bajo `.browser-profiles`. Un perfil con
+   cookies viejas reproduce este síntoma exacto, es determinista y **sobrevive a
+   todos los `restart` de `update-linux.sh`** — por eso "el update no arregla
+   nada". Reversible en 2 minutos:
+   ```bash
+   systemctl stop tokendian
+   mv /opt/tokendian/.browser-profiles/<tenant> /opt/tokendian/.browser-profiles/<tenant>.bak
+   systemctl start tokendian
+   ```
+   Si pasa, no era versión de nada.
+2. **Censo de las dos máquinas** (la que falla y una que funcione):
+   ```bash
+   google-chrome --version
+   /opt/tokendian/.venv/bin/pip show patchright | grep -i version
+   git -C /opt/tokendian rev-parse --short HEAD
+   journalctl -u tokendian -n 80 --no-pager | grep -i "DianLoginRejected\|ApplicationCookie"
+   ```
+3. Solo entonces, alinear versiones.
+
+### Criterio sobre fijar versiones
+
+- **patchright: sí se pinea.** Es dependencia nuestra y el pin es lo único que
+  impide que los servidores diverjan.
+- **Chrome: no se pinea.** Contra un WAF que se mueve, quedarse clavado en un
+  build viejo es el incidente del mes siguiente: lo que hoy pasa el filtro, en
+  tres meses es la firma rara. Que siga el estable, pero **sincronizado por el
+  update**, no por azar.
+- Una diferencia de versión entre dos servidores es **correlación**, no causa,
+  mientras no se reproduzca. Si tras alinear Chrome el fallo sigue, la hipótesis
+  muere y el arreglo es en `dian_login.py`: reintentar el `goto` comprobando
+  `.AspNet.ApplicationCookie` en `context.cookies()` entre intentos, en vez de
+  confiar en `networkidle` + 500 ms. Determinista y sin depender del build.
+
+### Lo que falta en los scripts
+
+- `update-linux.sh`: `pip install -r requirements.txt` y `patchright install
+  chrome` (el mismo comando que la instalación, idempotente), más un censo
+  impreso al final (`google-chrome --version`, versión de patchright, commit,
+  `HEADLESS`). Ese censo es lo que habría reducido este caso de dos días de
+  descarte a cinco segundos.
+- `/health` (`server.py:190-192`) devuelve `{"status":"ok","service":"tokendian"}`:
+  no permite auditar una flota sin entrar a cada servidor. Debería reportar
+  Chrome, patchright, `headless` y commit — versiones, no un mínimo exigido, que
+  nadie ha medido.
