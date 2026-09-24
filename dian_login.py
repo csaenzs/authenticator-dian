@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -210,6 +212,63 @@ async def _validate_saved_cookies_browser(p, base_cert: str, cert_path: str, cer
         await context.close()
 
 
+# ---------- diagnostico del handoff de login ----------
+#
+# El fallo que motivo esto: el submit pasa (cert OK, Turnstile OK, la URL queda
+# en base_cert), pero al visitar el dashboard la DIAN rebota a
+# /User/CertificateLogin. O sea: la sesion no llego a quedar establecida entre
+# el submit y el goto. Descartados en EMSSANAR el 2026-09-24: perfil de
+# navegador limpio y Chrome 147 -> 154. Lo que falta es ver la cadena de
+# redirects del handoff, que hoy no se registra en ningun lado.
+#
+# Los logs de URL y de NOMBRES de cookie van siempre: son inocuos y son
+# justamente el dato que falta. El volcado a disco (screenshot + HTML) lleva
+# datos de la empresa, asi que va detras de DIAN_DIAG=true y con permisos 0600.
+
+log = logging.getLogger("tokendian.login")
+
+DIAG_DIR = Path(os.getenv("DIAN_DIAG_DIR", str(ROOT / "diag")))
+
+
+def _diag_enabled() -> bool:
+    return os.getenv("DIAN_DIAG", "false").lower() == "true"
+
+
+async def _cookie_names(context) -> str:
+    """Nombres de las cookies del contexto. NUNCA los valores: son la sesion."""
+    try:
+        names = sorted({c.get("name", "?") for c in await context.cookies()})
+    except Exception as e:  # el contexto puede estar cerrandose
+        return f"<error: {e}>"
+    return ",".join(names) or "-"
+
+
+async def _log_step(context, page, step: str, trail: list[str]) -> None:
+    log.info("login[%s] url=%s cookies=%s", step, page.url, await _cookie_names(context))
+    log.info("login[%s] navegaciones=%s", step, " -> ".join(trail) or "-")
+
+
+async def _dump_failure(page, step: str) -> None:
+    """Screenshot + HTML al disco local para el post-mortem. Solo con DIAN_DIAG=true."""
+    if not _diag_enabled():
+        log.info("login[%s] volcado omitido (DIAN_DIAG != true)", step)
+        return
+    try:
+        DIAG_DIR.mkdir(parents=True, exist_ok=True)
+        base = DIAG_DIR / f"{datetime.now().strftime('%Y%m%dT%H%M%S')}-{step}"
+        png, html = base.with_suffix(".png"), base.with_suffix(".html")
+        await page.screenshot(path=str(png), full_page=True)
+        html.write_text(await page.content(), encoding="utf-8")
+        for f in (png, html):
+            try:
+                f.chmod(0o600)
+            except OSError:
+                pass
+        log.warning("login[%s] volcado en %s.{png,html}", step, base)
+    except Exception as e:
+        log.warning("login[%s] no se pudo volcar el diagnostico: %s", step, e)
+
+
 # ---------- login completo (browser + CapSolver) ----------
 
 async def _login_with_capsolver(
@@ -232,6 +291,15 @@ async def _login_with_capsolver(
         timezone_id="America/Bogota",
     )
     page = context.pages[0] if context.pages else await context.new_page()
+
+    # Cada navegacion del frame principal, en orden: es la unica forma de ver la
+    # cadena de redirects del handoff catalogo -> certificate -> /User/Authenticated
+    # y de saber en cual eslabon se pierde la sesion.
+    nav_trail: list[str] = []
+    page.on(
+        "framenavigated",
+        lambda f: nav_trail.append(f.url) if f is page.main_frame else None,
+    )
 
     try:
         await page.goto(f"{base_catalogo}/User/Login", wait_until="domcontentloaded")
@@ -281,12 +349,16 @@ async def _login_with_capsolver(
         async with page.expect_navigation(wait_until="domcontentloaded", timeout=45000):
             await submit_btn.click()
 
+        await _log_step(context, page, "post-submit", nav_trail)
+
         if "/User/Login" in page.url or "/User/CertificateLogin" in page.url:
+            await _dump_failure(page, "rechazo-submit")
             raise DianLoginRejected(
                 f"Login rechazado por DIAN tras submit. URL final: {page.url}. "
                 "Verifica cert, contraseña, NIT y cédula."
             )
         if not page.url.startswith(base_cert):
+            await _dump_failure(page, "redireccion-inesperada")
             raise DianLoginRejected(f"Redirección inesperada. URL final: {page.url}")
 
         # PARCHE LOCAL: networkidle (no domcontentloaded). El submit del form
@@ -296,9 +368,18 @@ async def _login_with_capsolver(
         # networkidle espera ~500ms sin requests, capturando todos los redirects.
         # Le damos un pequeño buffer extra para cookies HttpOnly que se setean
         # tras el último redirect.
+        antes_del_goto = len(nav_trail)
         await page.goto(f"{base_cert}/", wait_until="networkidle", timeout=30000)
         await page.wait_for_timeout(500)
+        log.info(
+            "login[post-goto] el goto disparo %d navegacion(es): %s",
+            len(nav_trail) - antes_del_goto,
+            " -> ".join(nav_trail[antes_del_goto:]) or "-",
+        )
+        await _log_step(context, page, "post-goto", nav_trail)
+
         if "/User/Login" in page.url or "/User/CertificateLogin" in page.url:
+            await _dump_failure(page, "sesion-no-establecida")
             raise DianLoginRejected(
                 f"Sesión no quedó establecida. Tras visitar dashboard redirigió a login: {page.url}"
             )
@@ -311,6 +392,7 @@ async def _login_with_capsolver(
         # 302 a /User/Login, no se auto-recuperan.
         cookies = await context.cookies()
         if not any(c.get("name") == ".AspNet.ApplicationCookie" for c in cookies):
+            await _dump_failure(page, "sin-application-cookie")
             raise DianLoginRejected(
                 "Login completó (URL OK) pero DIAN no emitió .AspNet.ApplicationCookie. "
                 "Posible rate-limit, anti-bot o sesión rechazada silenciosamente."

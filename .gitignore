@@ -9,6 +9,11 @@ set-env.ps1
 *.pem
 *.key
 cookies.json
+.browser-profiles/
+
+# Volcados de diagnostico del login (DIAN_DIAG=true): el HTML y el screenshot
+# llevan datos de la empresa. Nunca se versionan ni viajan por el canal.
+diag/
 
 # Python
 __pycache__/
